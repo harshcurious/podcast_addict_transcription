@@ -77,7 +77,7 @@ def test_worker_archives_success_and_reports_failure(tmp_path):
     ingest.worker(intake,
                   transcribe=lambda job: 0 if job.name == "a-good.mp3" else 3,
                   notify=lambda name, detail: notified.append((name, detail)),
-                  postprocess=lambda path: None)
+                  postprocess=lambda: None)
 
     assert (tmp_path / "archive" / "a-good.mp3").exists()
     assert (tmp_path / "inbox" / "b-bad.mp3.failed").exists()
@@ -97,7 +97,7 @@ def test_worker_survives_a_transcriber_that_cannot_start(tmp_path):
 
     ingest.worker(intake, transcribe=boom,
                   notify=lambda name, detail: notified.append(name),
-                  postprocess=lambda path: None)
+                  postprocess=lambda: None)
     assert notified == ["ep.mp3"]
     assert intake.status()["failed"] == ["ep.mp3"]
 

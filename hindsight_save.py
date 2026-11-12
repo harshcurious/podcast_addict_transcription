@@ -145,21 +145,28 @@ def queue(md_path, json_path=None):
     return path
 
 
-def submit(envelope):
-    """Send one pending retain request. Returns its Receipt, or None to keep it pending."""
-    body = json.dumps(envelope["payload"], ensure_ascii=False).encode("utf-8")
-    url = f"{API_URL}/v1/default/banks/{BANK_ID}/memories"
+def http_post(url, body, timeout):
+    """POST JSON bytes; returns (status, response text). The only network call here."""
     request = urllib.request.Request(url, data=body,
                                      headers={"Content-Type": "application/json"},
                                      method="POST")
     try:
-        with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
-            raw = response.read().decode("utf-8")
-            result = json.loads(raw)
-            if response.status != 200 or not result.get("success"):
-                raise RuntimeError(f"unexpected response {response.status}: {raw[:500]}")
-    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
-            json.JSONDecodeError, RuntimeError) as exc:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")
+
+
+def submit(envelope, post=http_post):
+    """Send one pending retain request. Returns its Receipt, or None to keep it pending."""
+    body = json.dumps(envelope["payload"], ensure_ascii=False).encode("utf-8")
+    url = f"{API_URL}/v1/default/banks/{BANK_ID}/memories"
+    try:
+        status, raw = post(url, body, TIMEOUT)
+        result = json.loads(raw)
+        if status != 200 or not result.get("success"):
+            raise RuntimeError(f"unexpected response {status}: {raw[:500]}")
+    except (OSError, ValueError, RuntimeError, AttributeError) as exc:
         log(f"ERROR retain submission kept pending document={envelope['document_id']}: {exc}")
         return None
 
@@ -174,9 +181,17 @@ def submit(envelope):
     }
 
 
-def flush():
+def retain(md_path, json_path=None, *, post=http_post):
+    """Queue one transcript for Retention and try to deliver it (and anything older).
+    True when this transcript was accepted; False leaves it queued for a later flush."""
+    path = queue(md_path, json_path)
+    flush(post)
+    return not path.exists()
+
+
+def flush(post=http_post):
     total = len(QUEUE.pending())
-    pending = QUEUE.drain(submit)
+    pending = QUEUE.drain(lambda envelope: submit(envelope, post))
     log(f"flush complete submitted={total - pending} pending={pending}")
     return 1 if pending else 0
 

@@ -13,17 +13,23 @@ Podcast Addict DOWNLOAD_COMPLETED broadcast
 Tasker HTTP POST /ingest with audio + metadata headers
         │
         ▼
-pa-ingest.py: token auth, SHA-256 dedupe, durable inbox, single worker
+ingest.py + intake.py: token auth, SHA-256 dedupe, durable inbox, single worker
         │
         ▼
 transcribe.py: ffmpeg → 16 kHz mono → faster-whisper CPU int8
-        │        raw .md + .srt + timestamped .json
+        │        raw .md + .srt + timestamped .json, then queues post-processing
         ▼
-clean_transcript_ai.py: structured ad-segment classification
+postprocess.py: drains the durable queue, one process for both steps below
+        │
+        ├─ clean_transcript_ai.py: structured ad-segment classification
         │        .clean.md + .ads.json audit manifest
         ▼
-hindsight_save.py: local Hindsight, bank podcast-addict
+   hindsight_save.py: local Hindsight, bank podcast-addict
 ```
+
+Supporting modules: `transcript.py` owns the transcript files and their rendering, `durable_queue.py` the pending/receipt retry queues. `GLOSSARY.md` defines the terms used in the code.
+
+If transcription of an episode fails, its audio is kept as `inbox/<name>.failed`, a message is sent through `hermes send` (see `PA_NOTIFY_TARGET`), and the episode can be uploaded again: download it again in Podcast Addict.
 
 The optional `/complete` endpoint supports a future completion gate, but it is disabled by default because Podcast Addict does not expose an authoritative played/completed broadcast.
 
@@ -115,6 +121,8 @@ Important settings in `config.env`:
 - `PA_CLEAN_MODEL`: primary AI ad classifier
 - `PA_CLEAN_FALLBACK_MODELS`: comma-separated fallback order
 - `PA_HINDSIGHT_BANK`: defaults to `podcast-addict`
+- `PA_NOTIFY_TARGET`: `hermes send` target for failure messages, default `telegram`; empty disables
+- `PA_PYTHON`: interpreter for the transcription and post-processing child processes, default `.venv/bin/python` next to the code
 
 The default cleaner is `deepseek-v4.1-flash-free`, followed by free MiMo/Beam variants and paid MiMo only if all free endpoints are unavailable. Review the provider's current privacy and retention terms before sending transcript text.
 
@@ -129,7 +137,7 @@ out/<show>/             raw .md/.srt/.json plus .clean.md/.ads.json
 logs/                   operational logs
 *-pending/              durable downstream retry queues
 *-receipts/             accepted-operation receipts
-seen.json               SHA-256 dedupe state
+seen.json               SHA-256 dedupe state (a failed episode is removed from it)
 ```
 
 Raw `.md`, `.srt`, and `.json` files are never rewritten by the ad cleaner. The `.ads.json` file records selected segment IDs, intervals, model use, and reasons. If AI cleaning fails, the transcript remains pending and is not retained uncleaned in Hindsight.

@@ -11,15 +11,14 @@ import hashlib
 import json
 import os
 import pathlib
-import subprocess
 import sys
 
-from clean_transcript_ai import CleanerConfig, is_reusable
+import hindsight_save
+from clean_transcript_ai import CleanerConfig, clean, hermes_ask, is_reusable, write_outputs
 from durable_queue import DurableQueue
 from transcript import Transcript
 
 ROOT = pathlib.Path(os.environ.get("PA_ROOT", "~/podcast-transcripts")).expanduser()
-PYTHON = pathlib.Path(sys.executable)
 PENDING = ROOT / "postprocess-pending"
 RECEIPTS = ROOT / "postprocess-receipts"
 LOG_PATH = ROOT / "logs" / "postprocess.log"
@@ -48,46 +47,43 @@ def queue(transcript_json):
     return path
 
 
-def run_logged(cmd):
-    proc = subprocess.run(cmd, capture_output=True, text=True)
-    if proc.stdout:
-        log(proc.stdout.strip()[-1500:])
-    if proc.returncode and proc.stderr:
-        log("ERROR " + proc.stderr.strip()[-1500:])
-    return proc.returncode
+def process(job, *, ask_model=None, post=None):
+    """Handle one pending job. Returns its Receipt, or None to keep it pending.
 
-
-def process(job):
-    """Handle one pending job. Returns its Receipt, or None to keep it pending."""
+    `ask_model` and `post` default to the Hermes CLI and a real HTTP POST.
+    Fails closed: if cleaning does not succeed, nothing is sent to Hindsight.
+    """
     name = job["audio_sha256"][:12]
     source = pathlib.Path(job["transcript_json"])
     if not source.exists():
         log(f"ERROR transcript missing; kept pending: {source}")
         return None
-    paths = Transcript(source)
-    clean_md, ads_json = paths.clean_path, paths.ads_path
+    config = CleanerConfig.from_env()
+    transcript = Transcript.load(source)
 
-    if not is_reusable(paths, CleanerConfig.from_env()):
-        rc = run_logged([str(PYTHON), str(ROOT / "clean_transcript_ai.py"), str(source)])
-        if rc:
-            log(f"AI cleaning failed rc={rc}; kept pending audio={name}")
+    if not is_reusable(transcript, config):
+        try:
+            result = clean(transcript, ask_model or hermes_ask(config), config)
+            write_outputs(transcript, result, config)
+        except Exception as exc:
+            log(f"AI cleaning failed; kept pending audio={name}: {exc}")
             return None
 
-    rc = run_logged([str(PYTHON), str(ROOT / "hindsight_save.py"), str(clean_md),
-                     "--json", str(source)])
-    if rc:
-        log(f"Hindsight submission failed rc={rc}; kept pending audio={name}")
+    if not hindsight_save.retain(transcript.clean_path, transcript.json_path,
+                                 post=post or hindsight_save.http_post):
+        log(f"Hindsight submission failed; kept pending audio={name}")
         return None
 
-    log(f"complete audio={name} clean={clean_md}")
+    log(f"complete audio={name} clean={transcript.clean_path}")
     return {**job, "completed_at": dt.datetime.now().isoformat(timespec="seconds"),
-            "clean_transcript": str(clean_md), "ads_manifest": str(ads_json),
-            "hindsight_bank": os.environ.get("PA_HINDSIGHT_BANK", "podcast-addict")}
+            "clean_transcript": str(transcript.clean_path),
+            "ads_manifest": str(transcript.ads_path),
+            "hindsight_bank": hindsight_save.BANK_ID}
 
 
-def flush():
+def flush(*, ask_model=None, post=None):
     total = len(QUEUE.pending())
-    pending = QUEUE.drain(process)
+    pending = QUEUE.drain(lambda job: process(job, ask_model=ask_model, post=post))
     log(f"flush complete processed={total - pending} pending={pending}")
     return 1 if pending else 0
 

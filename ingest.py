@@ -44,6 +44,7 @@ HERMES = (os.environ.get("PA_NOTIFY_HERMES") or os.environ.get("PA_CLEAN_HERMES"
 
 worker_lock = threading.Lock()
 postprocess_lock = threading.Lock()
+postprocess_again = threading.Event()
 state = {"received": 0, "transcribed": 0, "failed": 0, "last": None, "busy": False}
 
 
@@ -224,18 +225,30 @@ def build_server(intake, *, token="", max_bytes=MAX_BYTES, port=PORT, host="0.0.
     return ThreadingHTTPServer((host, port), handler)
 
 
-def run_postprocess(transcript_json=None):
-    """Run AI cleaning + Hindsight retention without blocking the ASR worker."""
+def _flush_postprocess():
+    cmd = [PYTHON, os.path.join(CODE_DIR, "postprocess.py"), "--flush"]
+    os.makedirs(LOGDIR, exist_ok=True)
+    with open(os.path.join(LOGDIR, "postprocess-worker.log"), "a") as lf:
+        return subprocess.call(cmd, stdout=lf, stderr=subprocess.STDOUT)
+
+
+def run_postprocess(flush=_flush_postprocess):
+    """Drain AI cleaning + Hindsight retention without blocking the ASR worker.
+
+    One drain runs at a time. A request that arrives while one is running makes it run
+    once more afterwards, so a Transcript queued mid-drain is not left waiting.
+    """
     if not postprocess_lock.acquire(blocking=False):
+        postprocess_again.set()
         return
     try:
-        cmd = [PYTHON, os.path.join(CODE_DIR, "postprocess.py")]
-        cmd += [transcript_json] if transcript_json else ["--flush"]
-        os.makedirs(LOGDIR, exist_ok=True)
-        with open(os.path.join(LOGDIR, "postprocess-worker.log"), "a") as lf:
-            rc = subprocess.call(cmd, stdout=lf, stderr=subprocess.STDOUT)
-        if rc:
-            log(f"postprocess pending rc={rc}; durable queue will retry")
+        while True:
+            postprocess_again.clear()
+            rc = flush()
+            if rc:
+                log(f"postprocess pending rc={rc}; durable queue will retry")
+            if not postprocess_again.is_set():
+                return
     finally:
         postprocess_lock.release()
 
@@ -243,7 +256,7 @@ def run_postprocess(transcript_json=None):
 def run_transcribe(job):
     """Transcribe one job in a child process (frees the model's memory afterwards)."""
     cmd = [PYTHON, os.path.join(CODE_DIR, "transcribe.py"), job.audio_path,
-           "--source-meta", job.meta_path, "--outdir", OUT]
+           "--source-meta", job.meta_path, "--outdir", OUT, "--enqueue-postprocess"]
     if job.meta.get("show"):
         cmd += ["--show", job.meta["show"]]
     os.makedirs(LOGDIR, exist_ok=True)
@@ -268,8 +281,8 @@ def notify_failure(name, detail):
         log(f"failure notification not sent: {exc}")
 
 
-def _postprocess_in_background(transcript_json):
-    threading.Thread(target=run_postprocess, args=(transcript_json,), daemon=True).start()
+def _postprocess_in_background():
+    threading.Thread(target=run_postprocess, daemon=True).start()
 
 
 def worker(intake, *, transcribe=run_transcribe, notify=notify_failure,
@@ -289,15 +302,8 @@ def worker(intake, *, transcribe=run_transcribe, notify=notify_failure,
                 log(f"transcribe could not start for {job.name}: {exc}")
                 rc = -1
             if rc == 0:
-                # transcribe.py enriches the sidecar with exact artifact paths.
-                transcript_json = None
-                try:
-                    with open(job.meta_path) as f:
-                        transcript_json = json.load(f).get("transcript_json")
-                except Exception:
-                    pass
-                if transcript_json:
-                    postprocess(transcript_json)
+                # transcribe.py has queued the Transcript for post-processing.
+                postprocess()
                 intake.finish(job, ok=True)
                 state["transcribed"] += 1
                 state["last"] = {"file": job.name, "status": "ok",

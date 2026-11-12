@@ -5,6 +5,7 @@ Transcribe one podcast audio file locally with faster-whisper (CTranslate2, CPU 
 Usage:
     transcribe.py AUDIO [--show NAME] [--model NAME] [--lang en] [--beam 1]
                          [--outdir DIR] [--keep-wav] [--source-meta JSON]
+                         [--enqueue-postprocess]
 
 Writes into <outdir>/<show-slug>/:
     <date>-<slug>.md    timestamped readable transcript (+ YAML front matter)
@@ -85,6 +86,8 @@ def main():
     ap.add_argument("--outdir", default=DEFAULT_OUT)
     ap.add_argument("--keep-wav", action="store_true")
     ap.add_argument("--source-meta", default="")
+    ap.add_argument("--enqueue-postprocess", action="store_true",
+                    help="queue the finished transcript for AI cleaning and Hindsight retention")
     args = ap.parse_args()
 
     src = os.path.abspath(args.audio)
@@ -169,17 +172,19 @@ def main():
     }
 
     Transcript(base + ".json", out_meta, segments).save_raw()
-    if args.source_meta:
-        try:
-            meta.update({"transcript_md": base + ".md", "transcript_srt": base + ".srt",
-                         "transcript_json": base + ".json", "title": title, "show": show})
-            with open(args.source_meta, "w") as f:
-                json.dump(meta, f, indent=2)
-        except Exception as exc:
-            log(f"WARNING could not update source metadata: {exc}")
     with open(os.path.join(args.outdir, "index.jsonl"), "a") as f:
         f.write(json.dumps({"md": base + ".md", **{k: v for k, v in out_meta.items()
                                                    if k not in ("segments",)}}) + "\n")
+
+    if args.enqueue_postprocess:
+        # Queued by the process that produced the Transcript, so a crash of the caller
+        # cannot leave a Transcript that is never cleaned.
+        try:
+            import postprocess
+            postprocess.queue(base + ".json")
+        except Exception as exc:
+            log(f"ERROR could not queue post-processing: {exc}")
+            return 3
 
     log(f"done: {base}.md | {out_meta['words']} words | {elapsed:.1f}s "
         f"for {info.duration/60:.1f} min audio ({rtf:.2f}x realtime) | lang={info.language}")
