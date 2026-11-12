@@ -97,6 +97,14 @@ def _write_json(path, data, indent=None):
     os.replace(tmp, path)
 
 
+def _sha256_of(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def _unlink(path):
     try:
         os.unlink(path)
@@ -191,22 +199,19 @@ class Intake:
         releases its digest from the Ledger, so the same Episode can be uploaded again.
         """
         with self._lock:
-            _unlink(job.meta_path)
             if ok:
                 if self.keep_audio:
                     shutil.move(job.audio_path, os.path.join(self._archive, job.name))
                 else:
                     _unlink(job.audio_path)
+                _unlink(job.meta_path)
                 return
-            os.replace(job.audio_path, job.audio_path + ".failed")
+            _unlink(job.meta_path)
+            failed_path = job.audio_path + ".failed"
+            os.replace(job.audio_path, failed_path)
+            digest = job.meta.get("sha256") or _sha256_of(failed_path)
             seen = _read_json(self._ledger)
-            digest = job.meta.get("sha256")
-            released = [d for d, entry in seen.items()
-                        if d == digest or (not digest and isinstance(entry, dict)
-                                           and entry.get("name") == job.name)]
-            for d in released:
-                del seen[d]
-            if released:
+            if seen.pop(digest, None) is not None:
                 _write_json(self._ledger, seen, indent=1)
 
     def status(self):

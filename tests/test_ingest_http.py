@@ -111,3 +111,48 @@ def test_notification_is_skipped_without_a_target_and_never_raises(monkeypatch):
     monkeypatch.setattr(ingest, "NOTIFY_TARGET", "telegram")
     ingest.notify_failure("ep.mp3", "rc=1")
     assert calls[0][0][:4] == [ingest.HERMES, "send", "--to", "telegram"]
+
+
+def test_worker_reports_and_stops_when_an_outcome_cannot_be_recorded(tmp_path, monkeypatch):
+    intake = Intake(tmp_path)
+    intake.accept(b"x", raw_name="ep.mp3")
+    notified = []
+
+    def cannot_finish(job, ok):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(intake, "finish", cannot_finish)
+    ingest.worker(intake, transcribe=lambda job: 0,
+                  notify=lambda name, detail: notified.append((name, detail)),
+                  postprocess=lambda: None)
+    assert notified and notified[0][0] == "ep.mp3" and "disk full" in notified[0][1]
+    assert ingest.state["busy"] is False
+    assert ingest.worker_lock.acquire(blocking=False)
+    ingest.worker_lock.release()
+
+
+def test_worker_picks_up_an_upload_that_arrives_as_it_finishes(tmp_path):
+    intake = Intake(tmp_path)
+    intake.accept(b"1", raw_name="a.mp3")
+    done = []
+
+    def transcribe(job):
+        done.append(job.name)
+        return 0
+
+    real_next = intake.next_job
+    state = {"late": False}
+
+    def next_job():
+        job = real_next()
+        if job is None and not state["late"]:
+            # The worker has just seen an empty queue; an upload lands before it exits.
+            state["late"] = True
+            intake.accept(b"2", raw_name="b.mp3")
+            ingest.worker(intake, transcribe=transcribe, postprocess=lambda: None)
+        return job
+
+    intake.next_job = next_job
+    ingest.worker(intake, transcribe=transcribe, notify=lambda *a: None,
+                  postprocess=lambda: None)
+    assert done == ["a.mp3", "b.mp3"]

@@ -131,12 +131,14 @@ def test_failed_episode_can_be_uploaded_again(tmp_path):
     assert intake.next_job().name == "ep.mp3"
 
 
-def test_failure_releases_digest_even_when_sidecar_was_unreadable(tmp_path):
+def test_failure_with_unreadable_sidecar_releases_only_that_episode(tmp_path):
     intake = Intake(tmp_path)
-    intake.accept(b"audio", raw_name="ep.mp3")
-    (tmp_path / "inbox" / "ep.mp3.json").write_text("{not json")
+    earlier = intake.accept(b"earlier", raw_name="episode.mp3")
+    intake.finish(intake.next_job(), ok=True)
+    intake.accept(b"later", raw_name="episode.mp3")
+    (tmp_path / "inbox" / "episode.mp3.json").write_text("{not json")
     intake.finish(intake.next_job(), ok=False)
-    assert ledger(tmp_path) == {}
+    assert list(ledger(tmp_path)) == [earlier.sha256]
 
 
 def test_concurrent_uploads_all_reach_the_ledger(tmp_path):

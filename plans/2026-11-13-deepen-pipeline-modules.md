@@ -170,14 +170,22 @@ Smaller choices made without asking: flat modules rather than a package (keeps s
 
 Not run until `/health` on the live service shows `"busy": false` and an empty queue.
 
+Stop the service **before** merging. The old `ingest.py` and the new `transcribe.py` do not work together: an Episode transcribed in the window between merge and restart would never be cleaned or retained. The same applies in reverse to a rollback.
+
 ```bash
+systemctl --user stop pa-ingest
 git -C ~/podcast-transcripts merge --ff-only deepen-modules
-systemctl --user restart pa-ingest
+systemctl --user start pa-ingest
 TOKEN="$(grep -oP 'PA_TOKEN=\K.*' ~/podcast-transcripts/config.env)"
 curl -s -H "X-PA-Token:$TOKEN" http://127.0.0.1:8787/health
 ```
 
-Expected: `"ok": true`, the same queue as before the restart, and `logs/ingest.log` shows `transcribing ...` within a few seconds. Rollback: `git -C ~/podcast-transcripts reset --hard <previous main>` then restart; no data format changed, so nothing else needs undoing.
+Expected: `"ok": true` and `logs/ingest.log` shows the startup line. Rollback: stop, `git -C ~/podcast-transcripts reset --hard <previous main>`, start; no data format changed, so nothing else needs undoing.
+
+Notes for the deploy:
+- Episodes that failed under the old code (`inbox/*.failed`) keep their digest in `seen.json` and still answer `duplicate`. Remove their entries by hand if they should be retried. `/health` lists them under `failed_files`, no longer under `queue`.
+- `hindsight_save.py X.clean.md` without `--json` now finds `X.json` and so uses the audio digest as the document id; before, it found no metadata and used a content hash.
+- With `PA_REQUIRE_COMPLETED=1`, a re-uploaded Episode is staged again and waits for `/complete`; the failure message does not mention that.
 
 ## Out of scope
 

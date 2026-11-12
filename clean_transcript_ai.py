@@ -221,18 +221,24 @@ def hermes_ask(config):
     return ask
 
 
+def _write_atomic(path, text):
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def write_outputs(transcript, result, config, *, out=None, manifest=None):
     """Write the Clean transcript and the Ad manifest. Returns their paths."""
     out = pathlib.Path(out).resolve() if out else transcript.clean_path
     manifest = pathlib.Path(manifest).resolve() if manifest else transcript.ads_path
     used = ",".join(result.models_used) or config.model
-    out.write_text(render_markdown(
+    _write_atomic(out, render_markdown(
         result.kept, transcript.meta, heading_suffix=" — cleaned", show_duration=False,
         front_matter_extra=(("ai_cleaner", f"{config.provider}/{used}"),
                             ("ad_intervals_removed", len(result.ranges))),
         notes=("AI-cleaned derivative; the raw transcript is preserved alongside this file.",),
-    ), encoding="utf-8")
-    manifest.write_text(json.dumps({
+    ))
+    _write_atomic(manifest, json.dumps({
         "cleaner": CLEANER_ID, "provider": config.provider, "model": config.model,
         "fallback_models": list(config.fallback_models), "models_used": result.models_used,
         "cleaned_at": dt.datetime.now().isoformat(timespec="seconds"),
@@ -240,7 +246,7 @@ def write_outputs(transcript, result, config, *, out=None, manifest=None):
         "segments_total": len(transcript.segments), "segments_removed": len(result.ad_ids),
         "seconds_removed": round(sum(r["end"] - r["start"] for r in result.ranges), 2),
         "ad_segment_ids": result.ad_ids, "intervals": result.ranges, "chunks": result.chunks,
-    }, indent=2), encoding="utf-8")
+    }, indent=2))
     return out, manifest
 
 

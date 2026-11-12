@@ -90,6 +90,10 @@ def main():
                     help="queue the finished transcript for AI cleaning and Hindsight retention")
     args = ap.parse_args()
 
+    postprocess = None
+    if args.enqueue_postprocess:
+        import postprocess  # before the slow work, so a broken setup fails at once
+
     src = os.path.abspath(args.audio)
     if not os.path.exists(src):
         log(f"ERROR audio not found: {src}")
@@ -172,19 +176,17 @@ def main():
     }
 
     Transcript(base + ".json", out_meta, segments).save_raw()
-    with open(os.path.join(args.outdir, "index.jsonl"), "a") as f:
-        f.write(json.dumps({"md": base + ".md", **{k: v for k, v in out_meta.items()
-                                                   if k not in ("segments",)}}) + "\n")
-
-    if args.enqueue_postprocess:
+    if postprocess:
         # Queued by the process that produced the Transcript, so a crash of the caller
         # cannot leave a Transcript that is never cleaned.
         try:
-            import postprocess
             postprocess.queue(base + ".json")
         except Exception as exc:
             log(f"ERROR could not queue post-processing: {exc}")
             return 3
+    with open(os.path.join(args.outdir, "index.jsonl"), "a") as f:
+        f.write(json.dumps({"md": base + ".md", **{k: v for k, v in out_meta.items()
+                                                   if k not in ("segments",)}}) + "\n")
 
     log(f"done: {base}.md | {out_meta['words']} words | {elapsed:.1f}s "
         f"for {info.duration/60:.1f} min audio ({rtf:.2f}x realtime) | lang={info.language}")

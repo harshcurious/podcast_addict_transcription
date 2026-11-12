@@ -238,19 +238,18 @@ def run_postprocess(flush=_flush_postprocess):
     One drain runs at a time. A request that arrives while one is running makes it run
     once more afterwards, so a Transcript queued mid-drain is not left waiting.
     """
-    if not postprocess_lock.acquire(blocking=False):
-        postprocess_again.set()
-        return
-    try:
-        while True:
-            postprocess_again.clear()
-            rc = flush()
-            if rc:
-                log(f"postprocess pending rc={rc}; durable queue will retry")
-            if not postprocess_again.is_set():
-                return
-    finally:
-        postprocess_lock.release()
+    postprocess_again.set()
+    while postprocess_again.is_set():
+        if not postprocess_lock.acquire(blocking=False):
+            return  # the running drain will see the flag
+        try:
+            while postprocess_again.is_set():
+                postprocess_again.clear()
+                rc = flush()
+                if rc:
+                    log(f"postprocess pending rc={rc}; durable queue will retry")
+        finally:
+            postprocess_lock.release()
 
 
 def run_transcribe(job):
@@ -285,38 +284,56 @@ def _postprocess_in_background():
     threading.Thread(target=run_postprocess, daemon=True).start()
 
 
+def _transcribe_queue(intake, transcribe, notify, postprocess):
+    """Work through the queue. Returns False if it had to stop on an unrecordable outcome."""
+    while True:
+        job = intake.next_job()
+        if job is None:
+            return True
+        log(f"transcribing {job.name} ...")
+        try:
+            rc = transcribe(job)
+        except Exception as exc:
+            log(f"transcribe could not start for {job.name}: {exc}")
+            rc = -1
+        try:
+            intake.finish(job, ok=(rc == 0))
+        except Exception as exc:
+            # The job is still in the inbox and would be picked again at once; stop
+            # instead of looping, and say so. The next upload or restart retries it.
+            state["last"] = {"file": job.name, "status": f"stuck: {exc}"}
+            log(f"STUCK {job.name}: could not record outcome rc={rc}: {exc}")
+            notify(job.name, f"could not record outcome: {exc}")
+            return False
+        if rc == 0:
+            # transcribe.py has queued the Transcript for post-processing.
+            postprocess()
+            state["transcribed"] += 1
+            state["last"] = {"file": job.name, "status": "ok",
+                             "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+        else:
+            state["failed"] += 1
+            state["last"] = {"file": job.name, "status": f"failed rc={rc}"}
+            log(f"FAILED {job.name} rc={rc} (see {LOGDIR}/worker.log)")
+            notify(job.name, f"rc={rc}")
+
+
 def worker(intake, *, transcribe=run_transcribe, notify=notify_failure,
            postprocess=_postprocess_in_background):
-    if not worker_lock.acquire(blocking=False):
-        return
-    try:
-        state["busy"] = True
-        while True:
-            job = intake.next_job()
-            if job is None:
-                return
-            log(f"transcribing {job.name} ...")
-            try:
-                rc = transcribe(job)
-            except Exception as exc:
-                log(f"transcribe could not start for {job.name}: {exc}")
-                rc = -1
-            if rc == 0:
-                # transcribe.py has queued the Transcript for post-processing.
-                postprocess()
-                intake.finish(job, ok=True)
-                state["transcribed"] += 1
-                state["last"] = {"file": job.name, "status": "ok",
-                                 "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-            else:
-                intake.finish(job, ok=False)
-                state["failed"] += 1
-                state["last"] = {"file": job.name, "status": f"failed rc={rc}"}
-                log(f"FAILED {job.name} rc={rc} (see {LOGDIR}/worker.log)")
-                notify(job.name, f"rc={rc}")
-    finally:
-        state["busy"] = False
-        worker_lock.release()
+    """Transcribe queued Episodes one at a time. Safe to call from any thread at any
+    time: if a worker is already running, this returns and that one does the work."""
+    while True:
+        if not worker_lock.acquire(blocking=False):
+            return
+        try:
+            state["busy"] = True
+            drained = _transcribe_queue(intake, transcribe, notify, postprocess)
+        finally:
+            state["busy"] = False
+            worker_lock.release()
+        # An upload may have landed between the last empty look and the release.
+        if not drained or intake.next_job() is None:
+            return
 
 
 def main():
