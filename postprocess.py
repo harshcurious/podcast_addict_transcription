@@ -14,6 +14,7 @@ import pathlib
 import subprocess
 import sys
 
+from clean_transcript_ai import CleanerConfig, is_reusable
 from transcript import Transcript
 
 ROOT = pathlib.Path(os.environ.get("PA_ROOT", "~/podcast-transcripts")).expanduser()
@@ -65,17 +66,7 @@ def process(path):
     paths = Transcript(source)
     clean_md, ads_json = paths.clean_path, paths.ads_path
 
-    # Existing output is reusable only if it is newer than the source and identifies the
-    # configured AI model. A changed model or source triggers re-cleaning.
-    provider = os.environ.get("PA_CLEAN_PROVIDER", "opencode-go")
-    model = os.environ.get("PA_CLEAN_MODEL", "deepseek-v4.1-flash-free")
-    reusable = False
-    if clean_md.exists() and ads_json.exists() and clean_md.stat().st_mtime >= source.stat().st_mtime:
-        try:
-            ads = json.loads(ads_json.read_text(encoding="utf-8"))
-            reusable = ads.get("provider") == provider and ads.get("model") == model
-        except Exception:
-            pass
+    reusable = is_reusable(paths, CleanerConfig.from_env())
     if not reusable:
         rc = run_logged([str(PYTHON), str(ROOT / "clean_transcript_ai.py"), str(source)])
         if rc:
