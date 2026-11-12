@@ -1,0 +1,35 @@
+# Local secrets and runtime configuration
+config.env
+*.env
+.env
+.env.*
+!.env.example
+
+# Audio, transcripts, and runtime state
+archive/
+inbox/
+staged/
+out/
+work/
+logs/
+seen.json
+*-pending/
+*-receipts/
+*.failed
+*.part
+
+# Python environments and generated files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp

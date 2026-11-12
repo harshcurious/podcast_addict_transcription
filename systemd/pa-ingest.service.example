@@ -1,0 +1,18 @@
+[Unit]
+Description=Podcast Addict to local Whisper transcript ingest
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/podcast-transcripts
+EnvironmentFile=%h/podcast-transcripts/config.env
+ExecStart=%h/podcast-transcripts/.venv/bin/python %h/podcast-transcripts/ingest.py
+Restart=on-failure
+RestartSec=5
+CPUWeight=40
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+
+[Install]
+WantedBy=default.target
