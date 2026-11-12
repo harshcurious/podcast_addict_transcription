@@ -16,11 +16,8 @@ Queue: files land in $PA_ROOT/inbox, a worker thread transcribes them one at a t
 """
 import email.parser
 import email.policy
-import hashlib
 import json
 import os
-import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -28,24 +25,22 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from intake import Intake, UnsupportedAudio
+
+CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.environ.get("PA_ROOT", os.path.expanduser("~/podcast-transcripts"))
-INBOX = os.path.join(ROOT, "inbox")
-STAGED = os.path.join(ROOT, "staged")
 OUT = os.environ.get("PA_OUTDIR", os.path.join(ROOT, "out"))
-ARCHIVE = os.path.join(ROOT, "archive")
 LOGDIR = os.path.join(ROOT, "logs")
-VENV_PY = os.path.join(ROOT, ".venv", "bin", "python")
+LOG_FILE = os.path.join(LOGDIR, "ingest.log")
+PYTHON = os.environ.get("PA_PYTHON") or os.path.join(CODE_DIR, ".venv", "bin", "python")
 PORT = int(os.environ.get("PA_PORT", "8787"))
 TOKEN = os.environ.get("PA_TOKEN", "")
 MAX_BYTES = int(os.environ.get("PA_MAX_MB", "800")) * 1024 * 1024
 KEEP_AUDIO = os.environ.get("PA_KEEP_AUDIO", "1") not in ("0", "false", "no")
 REQUIRE_COMPLETED = os.environ.get("PA_REQUIRE_COMPLETED", "1").lower() not in ("0", "false", "no")
-AUDIO_EXT = {".mp3", ".m4a", ".aac", ".ogg", ".opus", ".wav", ".flac", ".mp4", ".m4b", ".wma", ".webm"}
-
-for d in (INBOX, STAGED, OUT, ARCHIVE, LOGDIR):
-    os.makedirs(d, exist_ok=True)
-
-LOG_FILE = os.path.join(LOGDIR, "ingest.log")
+NOTIFY_TARGET = os.environ.get("PA_NOTIFY_TARGET", "telegram").strip()
+HERMES = (os.environ.get("PA_NOTIFY_HERMES") or os.environ.get("PA_CLEAN_HERMES")
+          or os.path.expanduser("~/.local/bin/hermes"))
 
 worker_lock = threading.Lock()
 postprocess_lock = threading.Lock()
@@ -58,49 +53,13 @@ def log(*a):
     line = time.strftime("%Y-%m-%d %H:%M:%S ") + " ".join(str(x) for x in a)
     print(line, flush=True)
     try:
+        os.makedirs(LOGDIR, exist_ok=True)
         if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > 5_000_000:
             os.replace(LOG_FILE, LOG_FILE + ".1")
         with open(LOG_FILE, "a") as f:
             f.write(line + "\n")
     except Exception:
         pass
-
-
-def safe_name(raw):
-    name = os.path.basename(urllib.parse.unquote(raw or "")).strip()
-    name = re.sub(r"[^\w\s.\-()&',\[\]+]", "_", name)
-    name = re.sub(r"\s+", " ", name).strip(" .")
-    if not name:
-        name = "episode.mp3"
-    if not os.path.splitext(name)[1]:
-        name += ".mp3"
-    return name[:180]
-
-
-def show_from_name(name):
-    """Podcast Addict names files either '<Show> - <Episode>.mp3' or the remote filename."""
-    stem = os.path.splitext(name)[0]
-    m = re.match(r"^(.+?)\s+[-–]\s+.+$", stem)
-    if m and len(m.group(1)) < 80:
-        return m.group(1).strip()
-    return ""
-
-
-def show_from_path(phone_path):
-    """Derive the show folder from Podcast Addict's .../podcast/<show>/<file> path."""
-    if not phone_path:
-        return ""
-    normalized = urllib.parse.unquote(phone_path).replace("\\", "/").rstrip("/")
-    parent = os.path.basename(os.path.dirname(normalized)).strip()
-    return parent[:160] if parent.lower() not in ("", "podcast") else ""
-
-
-def sha256_of(path):
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def parse_multipart(content_type, body):
@@ -119,9 +78,19 @@ def parse_multipart(content_type, body):
     return None, None
 
 
+def _header(headers, key, maxlen):
+    return (headers.get(key) or "").strip()[:maxlen]
+
+
 class Handler(BaseHTTPRequestHandler):
+    """HTTP adapter over Intake. Bound to its collaborators by build_server()."""
     server_version = "pa-ingest/1.0"
     protocol_version = "HTTP/1.1"
+    intake = None
+    token = ""
+    max_bytes = MAX_BYTES
+    outdir = OUT
+    on_queued = staticmethod(lambda: None)
 
     def _json(self, code, obj):
         data = json.dumps(obj).encode()
@@ -133,9 +102,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _authed(self, q):
-        if not TOKEN:
+        if not self.token:
             return True
-        return self.headers.get("X-PA-Token") == TOKEN or q.get("token", [""])[0] == TOKEN
+        return (self.headers.get("X-PA-Token") == self.token
+                or q.get("token", [""])[0] == self.token)
 
     def do_GET(self):
         u = urllib.parse.urlparse(self.path)
@@ -143,20 +113,22 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed(q):
             return self._json(401, {"error": "bad token"})
         if u.path == "/health":
-            pending = [f for f in os.listdir(INBOX) if not f.endswith((".json", ".done", ".part"))]
-            staged = [f for f in os.listdir(STAGED) if not f.endswith((".json", ".part"))]
-            return self._json(200, {"ok": True, "busy": state["busy"], "queue": sorted(pending),
-                                    "staged": sorted(staged), "completion_required": REQUIRE_COMPLETED,
+            status = self.intake.status()
+            return self._json(200, {"ok": True, "busy": state["busy"],
+                                    "queue": status["queue"], "staged": status["staged"],
+                                    "failed_files": status["failed"],
+                                    "completion_required": self.intake.require_completed,
                                     **{k: state[k] for k in ("received", "transcribed", "failed", "last")}})
         if u.path == "/transcripts":
-            idx = os.path.join(OUT, "index.jsonl")
+            idx = os.path.join(self.outdir, "index.jsonl")
             rows = []
             if os.path.exists(idx):
-                for line in open(idx):
-                    try:
-                        rows.append(json.loads(line))
-                    except Exception:
-                        pass
+                with open(idx) as f:
+                    for line in f:
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            pass
             return self._json(200, {"count": len(rows), "items": rows[-50:]})
         return self._json(404, {"error": "not found"})
 
@@ -164,40 +136,19 @@ class Handler(BaseHTTPRequestHandler):
         phone_path = (self.headers.get("X-PA-Path") or "").strip()
         raw_name = (q.get("name", [""])[0] or self.headers.get("X-PA-Name")
                     or os.path.basename(phone_path))
-        name = safe_name(raw_name)
-        staged_audio = os.path.join(STAGED, name)
-        staged_meta = staged_audio + ".json"
-        if not os.path.exists(staged_audio):
-            if os.path.exists(os.path.join(INBOX, name)):
-                return self._json(200, {"status": "already_queued", "name": name})
-            if os.path.exists(os.path.join(ARCHIVE, name)):
-                return self._json(200, {"status": "already_processed", "name": name})
-            return self._json(404, {"error": "staged episode not found", "name": name})
-
-        meta = {}
-        try:
-            meta = json.load(open(staged_meta))
-        except Exception:
-            pass
-        meta["completed_at"] = ((self.headers.get("X-PA-Completed-At") or "").strip()
-                                or time.strftime("%Y-%m-%dT%H:%M:%S"))
-        meta["completion_source"] = ((self.headers.get("X-PA-Completion-Source") or "").strip()
-                                     or "Tasker")[:100]
-        inbox_audio = os.path.join(INBOX, name)
-        inbox_meta = inbox_audio + ".json"
-        os.replace(staged_audio, inbox_audio)
-        with open(inbox_meta, "w") as f:
-            json.dump(meta, f, indent=2)
-        try:
-            os.unlink(staged_meta)
-        except OSError:
-            pass
-        log(f"completion confirmed; queued {name} completed_at={meta['completed_at']}")
-        threading.Thread(target=worker, daemon=True).start()
-        return self._json(202, {"status": "queued_after_completion", "name": name,
-                                "show": meta.get("show", ""),
-                                "sha256": meta.get("sha256", ""),
-                                "completed_at": meta["completed_at"]})
+        done = self.intake.complete(raw_name,
+                                    completed_at=self.headers.get("X-PA-Completed-At") or "",
+                                    source=self.headers.get("X-PA-Completion-Source") or "")
+        if done.status == "not_found":
+            return self._json(404, {"error": "staged episode not found", "name": done.name})
+        if done.status != "queued_after_completion":
+            return self._json(200, {"status": done.status, "name": done.name})
+        log(f"completion confirmed; queued {done.name} completed_at={done.meta['completed_at']}")
+        self.on_queued()
+        return self._json(202, {"status": done.status, "name": done.name,
+                                "show": done.meta.get("show", ""),
+                                "sha256": done.meta.get("sha256", ""),
+                                "completed_at": done.meta["completed_at"]})
 
     def do_POST(self):
         u = urllib.parse.urlparse(self.path)
@@ -212,8 +163,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
             return self._json(411, {"error": "Content-Length required"})
-        if length > MAX_BYTES:
-            return self._json(413, {"error": f"too large (>{MAX_BYTES//1048576} MB)"})
+        if length > self.max_bytes:
+            return self._json(413, {"error": f"too large (>{self.max_bytes//1048576} MB)"})
 
         ctype = self.headers.get("Content-Type", "")
         body = self.rfile.read(length)
@@ -229,66 +180,48 @@ class Handler(BaseHTTPRequestHandler):
         else:
             payload = body
 
-        name = safe_name(q.get("name", [""])[0]
-                         or self.headers.get("X-PA-Name")
-                         or fname or "episode.mp3")
-        if os.path.splitext(name)[1].lower() not in AUDIO_EXT:
-            return self._json(400, {"error": f"unsupported extension for {name}"})
+        h = self.headers
+        try:
+            got = self.intake.accept(
+                payload,
+                raw_name=q.get("name", [""])[0] or h.get("X-PA-Name") or fname or "episode.mp3",
+                show_hint=q.get("show", [""])[0] or h.get("X-PA-Show") or "",
+                phone_path=(h.get("X-PA-Path") or "").strip(),
+                original_name=fname,
+                fields={
+                    "source_app": _header(h, "X-PA-Source", 100) or "Podcast Addict",
+                    "source_device": _header(h, "X-PA-Device", 100),
+                    "feed_url": _header(h, "X-PA-Feed-URL", 2000),
+                    "episode_url": _header(h, "X-PA-Episode-URL", 2000),
+                    "published_at": _header(h, "X-PA-Published-At", 100),
+                    "completed_at": _header(h, "X-PA-Completed-At", 100),
+                })
+        except UnsupportedAudio as e:
+            return self._json(400, {"error": f"unsupported extension for {e}"})
 
-        phone_path = (self.headers.get("X-PA-Path") or "").strip()
-        show = (q.get("show", [""])[0] or self.headers.get("X-PA-Show") or "").strip() \
-            or show_from_path(phone_path) or show_from_name(name)
-
-        target_dir = STAGED if REQUIRE_COMPLETED else INBOX
-        tmp = os.path.join(target_dir, name + ".part")
-        with open(tmp, "wb") as f:
-            f.write(payload)
-        digest = sha256_of(tmp)
-
-        seen_file = os.path.join(ROOT, "seen.json")
-        seen = {}
-        if os.path.exists(seen_file):
-            try:
-                seen = json.load(open(seen_file))
-            except Exception:
-                seen = {}
-        if digest in seen:
-            os.unlink(tmp)
-            log(f"duplicate upload ignored: {name} ({digest[:12]})")
-            return self._json(200, {"status": "duplicate", "sha256": digest,
-                                     "existing": seen[digest]})
-
-        dest = os.path.join(target_dir, name)
-        os.replace(tmp, dest)
-        meta = {
-            "sha256": digest,
-            "show": show,
-            "received_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "bytes": len(payload),
-            "original_name": fname or name,
-            "source_path": phone_path,
-            "source_app": (self.headers.get("X-PA-Source") or "Podcast Addict").strip()[:100],
-            "source_device": (self.headers.get("X-PA-Device") or "").strip()[:100],
-            "feed_url": (self.headers.get("X-PA-Feed-URL") or "").strip()[:2000],
-            "episode_url": (self.headers.get("X-PA-Episode-URL") or "").strip()[:2000],
-            "published_at": (self.headers.get("X-PA-Published-At") or "").strip()[:100],
-            "completed_at": (self.headers.get("X-PA-Completed-At") or "").strip()[:100],
-        }
-        with open(os.path.join(target_dir, name + ".json"), "w") as f:
-            json.dump(meta, f)
-        seen[digest] = {"name": name, "at": meta["received_at"]}
-        json.dump(seen, open(seen_file, "w"), indent=1)
-
+        if got.status == "duplicate":
+            log(f"duplicate upload ignored: {got.name} ({got.sha256[:12]})")
+            return self._json(200, {"status": "duplicate", "sha256": got.sha256,
+                                    "existing": got.existing})
         state["received"] += 1
-        status = "staged_until_completion" if REQUIRE_COMPLETED else "queued"
-        log(f"{status} {name} ({len(payload)/1048576:.1f} MB, show={show or '?'}, sha={digest[:12]})")
-        if not REQUIRE_COMPLETED:
-            threading.Thread(target=worker, daemon=True).start()
-        return self._json(202, {"status": status, "name": name, "show": show,
-                                "sha256": digest, "completion_required": REQUIRE_COMPLETED})
+        log(f"{got.status} {got.name} ({len(payload)/1048576:.1f} MB, "
+            f"show={got.show or '?'}, sha={got.sha256[:12]})")
+        if got.status == "queued":
+            self.on_queued()
+        return self._json(202, {"status": got.status, "name": got.name, "show": got.show,
+                                "sha256": got.sha256,
+                                "completion_required": self.intake.require_completed})
 
     def log_message(self, fmt, *args):
         log(f"{self.address_string()} {fmt % args}")
+
+
+def build_server(intake, *, token="", max_bytes=MAX_BYTES, port=PORT, host="0.0.0.0",
+                 outdir=OUT, on_queued=lambda: None):
+    handler = type("BoundHandler", (Handler,), {
+        "intake": intake, "token": token, "max_bytes": max_bytes, "outdir": outdir,
+        "on_queued": staticmethod(on_queued)})
+    return ThreadingHTTPServer((host, port), handler)
 
 
 def run_postprocess(transcript_json=None):
@@ -296,8 +229,9 @@ def run_postprocess(transcript_json=None):
     if not postprocess_lock.acquire(blocking=False):
         return
     try:
-        cmd = [VENV_PY, os.path.join(ROOT, "postprocess.py")]
+        cmd = [PYTHON, os.path.join(CODE_DIR, "postprocess.py")]
         cmd += [transcript_json] if transcript_json else ["--flush"]
+        os.makedirs(LOGDIR, exist_ok=True)
         with open(os.path.join(LOGDIR, "postprocess-worker.log"), "a") as lf:
             rc = subprocess.call(cmd, stdout=lf, stderr=subprocess.STDOUT)
         if rc:
@@ -306,81 +240,93 @@ def run_postprocess(transcript_json=None):
         postprocess_lock.release()
 
 
-def worker():
+def run_transcribe(job):
+    """Transcribe one job in a child process (frees the model's memory afterwards)."""
+    cmd = [PYTHON, os.path.join(CODE_DIR, "transcribe.py"), job.audio_path,
+           "--source-meta", job.meta_path, "--outdir", OUT]
+    if job.meta.get("show"):
+        cmd += ["--show", job.meta["show"]]
+    os.makedirs(LOGDIR, exist_ok=True)
+    with open(os.path.join(LOGDIR, "worker.log"), "a") as lf:
+        return subprocess.call(cmd, stdout=lf, stderr=subprocess.STDOUT)
+
+
+def notify_failure(name, detail):
+    """Tell the owner on their messaging platform that an Episode failed. Never raises."""
+    if not NOTIFY_TARGET:
+        return
+    message = (f"Podcast transcription failed: {name} ({detail}). "
+               "Download the episode again in Podcast Addict to retry. "
+               f"The audio is kept as inbox/{name}.failed.")
+    try:
+        proc = subprocess.run([HERMES, "send", "--to", NOTIFY_TARGET, "-q", message],
+                              capture_output=True, text=True, timeout=90)
+        if proc.returncode:
+            log(f"failure notification not sent rc={proc.returncode}: "
+                f"{(proc.stderr or proc.stdout).strip()[-300:]}")
+    except Exception as exc:
+        log(f"failure notification not sent: {exc}")
+
+
+def _postprocess_in_background(transcript_json):
+    threading.Thread(target=run_postprocess, args=(transcript_json,), daemon=True).start()
+
+
+def worker(intake, *, transcribe=run_transcribe, notify=notify_failure,
+           postprocess=_postprocess_in_background):
     if not worker_lock.acquire(blocking=False):
         return
     try:
         state["busy"] = True
         while True:
-            jobs = sorted(f for f in os.listdir(INBOX)
-                          if not f.endswith((".json", ".done", ".part", ".failed"))
-                          and os.path.splitext(f)[1].lower() in AUDIO_EXT)
-            if not jobs:
+            job = intake.next_job()
+            if job is None:
                 return
-            name = jobs[0]
-            path = os.path.join(INBOX, name)
-            meta_path = path + ".json"
-            meta = {}
+            log(f"transcribing {job.name} ...")
             try:
-                meta = json.load(open(meta_path))
-            except Exception:
-                pass
-            log(f"transcribing {name} ...")
-            cmd = [VENV_PY, os.path.join(ROOT, "transcribe.py"), path,
-                   "--source-meta", meta_path,
-                   "--outdir", OUT]
-            if meta.get("show"):
-                cmd += ["--show", meta["show"]]
-            with open(os.path.join(LOGDIR, "worker.log"), "a") as lf:
-                rc = subprocess.call(cmd, stdout=lf, stderr=subprocess.STDOUT)
+                rc = transcribe(job)
+            except Exception as exc:
+                log(f"transcribe could not start for {job.name}: {exc}")
+                rc = -1
             if rc == 0:
                 # transcribe.py enriches the sidecar with exact artifact paths.
+                transcript_json = None
                 try:
-                    meta = json.load(open(meta_path))
+                    with open(job.meta_path) as f:
+                        transcript_json = json.load(f).get("transcript_json")
                 except Exception:
                     pass
-                transcript_json = meta.get("transcript_json")
                 if transcript_json:
-                    threading.Thread(target=run_postprocess, args=(transcript_json,),
-                                     daemon=True).start()
-                open(path + ".done", "w").close()
+                    postprocess(transcript_json)
+                intake.finish(job, ok=True)
                 state["transcribed"] += 1
-                state["last"] = {"file": name, "status": "ok",
+                state["last"] = {"file": job.name, "status": "ok",
                                  "at": time.strftime("%Y-%m-%dT%H:%M:%S")}
-                try:
-                    os.unlink(meta_path)
-                except OSError:
-                    pass
-                if KEEP_AUDIO:
-                    shutil.move(path, os.path.join(ARCHIVE, name))
-                else:
-                    os.unlink(path)
-                try:
-                    os.unlink(path + ".done")
-                except OSError:
-                    pass
             else:
+                intake.finish(job, ok=False)
                 state["failed"] += 1
-                state["last"] = {"file": name, "status": f"failed rc={rc}"}
-                log(f"FAILED {name} rc={rc} (see {LOGDIR}/worker.log)")
-                os.replace(path, path + ".failed")
-                try:
-                    os.unlink(meta_path)
-                except OSError:
-                    pass
+                state["last"] = {"file": job.name, "status": f"failed rc={rc}"}
+                log(f"FAILED {job.name} rc={rc} (see {LOGDIR}/worker.log)")
+                notify(job.name, f"rc={rc}")
     finally:
         state["busy"] = False
         worker_lock.release()
 
 
 def main():
-    if not os.path.exists(VENV_PY):
-        log(f"WARNING: venv python missing at {VENV_PY}; run setup first")
+    if not os.path.exists(PYTHON):
+        log(f"WARNING: venv python missing at {PYTHON}; run setup first")
+    os.makedirs(OUT, exist_ok=True)
+    intake = Intake(ROOT, keep_audio=KEEP_AUDIO, require_completed=REQUIRE_COMPLETED)
+
+    def start_worker():
+        threading.Thread(target=worker, args=(intake,), daemon=True).start()
+
     log(f"pa-ingest listening on 0.0.0.0:{PORT}  root={ROOT}  out={OUT}  "
         f"auth={'on' if TOKEN else 'off'}  keep_audio={KEEP_AUDIO}")
     threading.Thread(target=run_postprocess, daemon=True).start()
-    threading.Thread(target=worker, daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
+    start_worker()
+    build_server(intake, token=TOKEN, on_queued=start_worker).serve_forever()
 
 
 if __name__ == "__main__":
