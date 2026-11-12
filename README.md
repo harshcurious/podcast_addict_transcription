@@ -161,7 +161,9 @@ curl -s -H "X-PA-Token:$TOKEN" http://127.0.0.1:8787/transcripts
 ## Development checks
 
 ```bash
-python3 -m py_compile ingest.py transcribe.py clean_transcript_ai.py postprocess.py hindsight_save.py
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
 ```
 
-GitHub Actions runs the same syntax check and a basic repository secret scan on pushes and pull requests.
+The tests need neither `faster-whisper` nor a network. GitHub Actions runs a syntax check, the tests, and a basic repository secret scan on pushes and pull requests. Domain terms are defined in `GLOSSARY.md`.
