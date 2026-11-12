@@ -20,6 +20,8 @@ import urllib.error
 import urllib.request
 import uuid
 
+from transcript import Transcript, is_clean_path, json_path_for
+
 ROOT = pathlib.Path(os.environ.get("PA_ROOT", "~/podcast-transcripts")).expanduser()
 API_URL = os.environ.get("PA_HINDSIGHT_URL", "http://127.0.0.1:8888").rstrip("/")
 BANK_ID = os.environ.get("PA_HINDSIGHT_BANK", "podcast-addict")
@@ -41,7 +43,7 @@ def load_transcript(md_path, json_path=None):
     md_path = pathlib.Path(md_path).resolve()
     content = md_path.read_text(encoding="utf-8")
     meta = {}
-    sidecar = pathlib.Path(json_path).resolve() if json_path else md_path.with_suffix(".json")
+    sidecar = pathlib.Path(json_path).resolve() if json_path else json_path_for(md_path)
     if sidecar.exists():
         try:
             data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -93,8 +95,8 @@ def load_transcript(md_path, json_path=None):
         "language": str(meta.get("language") or ""),
         "transcribed_at": str(meta.get("transcribed_at") or ""),
     }
-    ads_path = md_path.with_name(md_path.name.replace(".clean.md", ".ads.json"))
-    if ads_path.exists():
+    ads_path = Transcript(sidecar).ads_path
+    if is_clean_path(md_path) and ads_path.exists():
         try:
             ads = json.loads(ads_path.read_text(encoding="utf-8"))
             metadata.update({

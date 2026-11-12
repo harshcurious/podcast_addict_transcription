@@ -23,6 +23,8 @@ import sys
 import time
 import unicodedata
 
+from transcript import Transcript
+
 DEFAULT_MODEL = os.environ.get("PA_MODEL", "base.en")
 DEFAULT_OUT = os.environ.get("PA_OUTDIR", os.path.expanduser("~/podcast-transcripts/out"))
 WORK = os.environ.get("PA_WORK", os.path.expanduser("~/podcast-transcripts/work"))
@@ -66,56 +68,6 @@ def decode_to_pcm(path):
            "-f", "s16le", "-ac", "1", "-acodec", "pcm_s16le", "-ar", "16000", "-"]
     proc = subprocess.run(cmd, capture_output=True, check=True)
     return np.frombuffer(proc.stdout, np.int16).flatten().astype(np.float32) / 32768.0
-
-
-def ts_md(seconds):
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h:d}:{m:02d}:{s:02d}" if h else f"{m:d}:{s:02d}"
-
-
-def ts_srt(seconds):
-    ms = int(round((seconds - int(seconds)) * 1000))
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
-
-
-def build_markdown(segments, meta):
-    lines = ["---"]
-    for k in ("title", "show", "source_file", "audio_duration", "model",
-              "language", "transcribed_at", "rtf", "audio_sha256"):
-        if meta.get(k) not in (None, ""):
-            val = str(meta[k]).replace('"', "'")
-            lines.append(f'{k}: "{val}"')
-    lines += ["---", "", f"# {meta.get('title') or 'Transcript'}", ""]
-    if meta.get("show"):
-        lines.append(f"*{meta['show']}* — {ts_md(meta.get('audio_duration') or 0)}")
-        lines.append("")
-    # merge consecutive segments into readable paragraphs of ~600 chars
-    para, para_start, body = [], None, []
-    for seg in segments:
-        if para_start is None:
-            para_start = seg["start"]
-        para.append(seg["text"].strip())
-        if sum(len(p) + 1 for p in para) > 600 or (seg["end"] - para_start) > 75:
-            body.append(f"**[{ts_md(para_start)}]** " + " ".join(para))
-            body.append("")
-            para, para_start = [], None
-    if para:
-        body.append(f"**[{ts_md(para_start)}]** " + " ".join(para))
-    lines += body
-    return "\n".join(lines) + "\n"
-
-
-def build_srt(segments):
-    out = []
-    for i, seg in enumerate(segments, 1):
-        out.append(str(i))
-        out.append(f"{ts_srt(seg['start'])} --> {ts_srt(seg['end'])}")
-        out.append(seg["text"].strip())
-        out.append("")
-    return "\n".join(out)
 
 
 def main():
@@ -216,12 +168,7 @@ def main():
         "words": sum(len(s["text"].split()) for s in segments),
     }
 
-    with open(base + ".md", "w") as f:
-        f.write(build_markdown(segments, out_meta))
-    with open(base + ".srt", "w") as f:
-        f.write(build_srt(segments))
-    with open(base + ".json", "w") as f:
-        json.dump({"meta": out_meta, "segments": segments}, f, indent=1)
+    Transcript(base + ".json", out_meta, segments).save_raw()
     if args.source_meta:
         try:
             meta.update({"transcript_md": base + ".md", "transcript_srt": base + ".srt",

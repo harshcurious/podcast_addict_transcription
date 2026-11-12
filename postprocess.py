@@ -14,6 +14,8 @@ import pathlib
 import subprocess
 import sys
 
+from transcript import Transcript
+
 ROOT = pathlib.Path(os.environ.get("PA_ROOT", "~/podcast-transcripts")).expanduser()
 PYTHON = pathlib.Path(sys.executable)
 PENDING = ROOT / "postprocess-pending"
@@ -60,8 +62,8 @@ def process(path):
     if not source.exists():
         log(f"ERROR transcript missing; kept pending: {source}")
         return False
-    clean_md = source.with_suffix(".clean.md")
-    ads_json = source.with_suffix(".ads.json")
+    paths = Transcript(source)
+    clean_md, ads_json = paths.clean_path, paths.ads_path
 
     # Existing output is reusable only if it is newer than the source and identifies the
     # configured AI model. A changed model or source triggers re-cleaning.

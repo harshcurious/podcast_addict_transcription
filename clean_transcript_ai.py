@@ -15,6 +15,8 @@ import subprocess
 import tempfile
 import time
 
+from transcript import Transcript, render_markdown
+
 ROOT = pathlib.Path(os.environ.get("PA_ROOT", "~/podcast-transcripts")).expanduser()
 HERMES = os.environ.get("PA_CLEAN_HERMES", str(pathlib.Path.home() / ".local/bin/hermes"))
 PROVIDER = os.environ.get("PA_CLEAN_PROVIDER", "opencode-go")
@@ -35,12 +37,6 @@ def log(message):
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with LOG_PATH.open("a") as f:
         f.write(line + "\n")
-
-
-def ts(seconds):
-    m, s = divmod(int(seconds), 60)
-    h, m = divmod(m, 60)
-    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
 
 
 def make_cores(segments):
@@ -160,32 +156,11 @@ def contiguous_ranges(ids, segments):
 
 
 def build_markdown(kept, meta, ranges):
-    lines = ["---"]
-    keys = ("title", "show", "source_file", "audio_duration", "model", "language",
-            "transcribed_at", "rtf", "audio_sha256")
-    for key in keys:
-        value = meta.get(key)
-        if value not in (None, ""):
-            lines.append(f'{key}: "{str(value).replace(chr(34), chr(39))}"')
-    lines += [f'ai_cleaner: "{PROVIDER}/{MODEL}"',
-              f'ad_intervals_removed: "{len(ranges)}"', "---", "",
-              f"# {meta.get('title') or 'Transcript'} — cleaned", ""]
-    if meta.get("show"):
-        lines += [f"*{meta['show']}*", ""]
-    lines += ["*AI-cleaned derivative; the raw transcript is preserved alongside this file.*", ""]
-
-    para, para_start, para_end = [], None, None
-    for seg in kept:
-        if para_start is None:
-            para_start = seg["start"]
-        para_end = seg["end"]
-        para.append(seg["text"].strip())
-        if sum(len(x) + 1 for x in para) > 600 or para_end - para_start > 75:
-            lines += [f"**[{ts(para_start)}]** " + " ".join(para), ""]
-            para, para_start, para_end = [], None, None
-    if para:
-        lines.append(f"**[{ts(para_start)}]** " + " ".join(para))
-    return "\n".join(lines) + "\n"
+    return render_markdown(
+        kept, meta, heading_suffix=" — cleaned", show_duration=False,
+        front_matter_extra=(("ai_cleaner", f"{PROVIDER}/{MODEL}"),
+                            ("ad_intervals_removed", len(ranges))),
+        notes=("AI-cleaned derivative; the raw transcript is preserved alongside this file.",))
 
 
 def main():
@@ -195,9 +170,8 @@ def main():
     ap.add_argument("--manifest")
     args = ap.parse_args()
 
-    source = pathlib.Path(args.json_transcript).resolve()
-    data = json.loads(source.read_text(encoding="utf-8"))
-    segments, meta = data["segments"], data.get("meta", {})
+    transcript = Transcript.load(args.json_transcript)
+    source, segments, meta = transcript.json_path, transcript.segments, transcript.meta
     results = []
     for chunk_no, (start, end) in enumerate(make_cores(segments), 1):
         log(f"classifying chunk={chunk_no} core={start}:{end} via {PROVIDER}/{MODEL}")
@@ -207,9 +181,9 @@ def main():
     ad_set = set(ad_ids)
     kept = [seg for i, seg in enumerate(segments) if i not in ad_set]
     ranges = contiguous_ranges(ad_ids, segments)
-    out = pathlib.Path(args.out).resolve() if args.out else source.with_suffix(".clean.md")
+    out = pathlib.Path(args.out).resolve() if args.out else transcript.clean_path
     manifest = (pathlib.Path(args.manifest).resolve() if args.manifest
-                else source.with_suffix(".ads.json"))
+                else transcript.ads_path)
     out.write_text(build_markdown(kept, meta, ranges), encoding="utf-8")
     models_used = sorted(set(result["model"] for result in results))
     manifest_data = {
