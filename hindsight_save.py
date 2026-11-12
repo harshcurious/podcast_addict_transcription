@@ -20,6 +20,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from durable_queue import DurableQueue
 from transcript import Transcript, is_clean_path, json_path_for
 
 ROOT = pathlib.Path(os.environ.get("PA_ROOT", "~/podcast-transcripts")).expanduser()
@@ -123,15 +124,15 @@ def load_transcript(md_path, json_path=None):
     }, document_id, operation_id, content_sha
 
 
-def pending_path(document_id):
-    key = hashlib.sha256(document_id.encode()).hexdigest()[:24]
-    return PENDING / f"{key}.json"
+QUEUE = DurableQueue(PENDING, RECEIPTS, log)
+
+
+def pending_name(document_id):
+    return hashlib.sha256(document_id.encode()).hexdigest()[:24] + ".json"
 
 
 def queue(md_path, json_path=None):
     payload, document_id, operation_id, content_sha = load_transcript(md_path, json_path)
-    PENDING.mkdir(parents=True, exist_ok=True)
-    path = pending_path(document_id)
     envelope = {
         "queued_at": dt.datetime.now().isoformat(timespec="seconds"),
         "document_id": document_id,
@@ -139,15 +140,13 @@ def queue(md_path, json_path=None):
         "content_sha256": content_sha,
         "payload": payload,
     }
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, path)
+    path = QUEUE.enqueue(pending_name(document_id), envelope)
     log(f"queued document={document_id} operation={operation_id} pending={path.name}")
     return path
 
 
-def submit(path):
-    envelope = json.loads(path.read_text(encoding="utf-8"))
+def submit(envelope):
+    """Send one pending retain request. Returns its Receipt, or None to keep it pending."""
     body = json.dumps(envelope["payload"], ensure_ascii=False).encode("utf-8")
     url = f"{API_URL}/v1/default/banks/{BANK_ID}/memories"
     request = urllib.request.Request(url, data=body,
@@ -161,36 +160,25 @@ def submit(path):
                 raise RuntimeError(f"unexpected response {response.status}: {raw[:500]}")
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
             json.JSONDecodeError, RuntimeError) as exc:
-        log(f"ERROR retain submission kept pending file={path.name}: {exc}")
-        return False
+        log(f"ERROR retain submission kept pending document={envelope['document_id']}: {exc}")
+        return None
 
-    RECEIPTS.mkdir(parents=True, exist_ok=True)
-    receipt = {
+    log(f"accepted document={envelope['document_id']} operation="
+        f"{result.get('operation_id') or result.get('operation_ids')}")
+    return {
         "accepted_at": dt.datetime.now().isoformat(timespec="seconds"),
         "document_id": envelope["document_id"],
         "content_sha256": envelope["content_sha256"],
         "request_operation_id": envelope["operation_id"],
         "response": result,
     }
-    destination = RECEIPTS / path.name
-    tmp = destination.with_suffix(".tmp")
-    tmp.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
-    os.replace(tmp, destination)
-    path.unlink()
-    log(f"accepted document={envelope['document_id']} operation="
-        f"{result.get('operation_id') or result.get('operation_ids')}")
-    return True
 
 
 def flush():
-    PENDING.mkdir(parents=True, exist_ok=True)
-    paths = sorted(PENDING.glob("*.json"))
-    failed = 0
-    for path in paths:
-        if not submit(path):
-            failed += 1
-    log(f"flush complete submitted={len(paths) - failed} pending={failed}")
-    return 1 if failed else 0
+    total = len(QUEUE.pending())
+    pending = QUEUE.drain(submit)
+    log(f"flush complete submitted={total - pending} pending={pending}")
+    return 1 if pending else 0
 
 
 def main():
