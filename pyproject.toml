@@ -1,5 +1,5 @@
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests", "backfill/tests"]
 
 [tool.ruff]
 line-length = 100

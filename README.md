@@ -158,6 +158,14 @@ curl -s -H "X-PA-Token:$TOKEN" http://127.0.0.1:8787/health
 curl -s -H "X-PA-Token:$TOKEN" http://127.0.0.1:8787/transcripts
 ```
 
+## Backfilling past listens
+
+`backfill/` is a separate, Mac-only tool for Episodes listened to before this service
+existed. It reads a Podcast Addict backup and uses the publisher's transcript where one is
+online, or transcribes locally with mlx-whisper. Each transcript is cleaned with the same
+ad classifier and retained in the same Hindsight bank. It imports the pipeline modules
+without changing them and does not run on the Pi. See `backfill/README.md`.
+
 ## Security and privacy
 
 - `config.env` is never committed.

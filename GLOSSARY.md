@@ -27,3 +27,14 @@ model, and why.
 
 **Receipt**: the file written when a queued job is accepted downstream; its presence means
 the job will not be retried.
+
+**Listened Episode**: an Episode that a Podcast Addict backup records as played
+(`seen_status = 1`) or as completed in its listening history. The input to the Backfill.
+
+**Backfill**: the Mac-only process in `backfill/` that gives every Listened Episode a Clean
+transcript in Hindsight. Its Hindsight document ID is `podcast:episode:<key>`, where the key
+comes from the feed URL and the item GUID.
+
+**Publisher transcript**: a transcript the podcast itself publishes online (a
+`<podcast:transcript>` feed tag, or a URL stored by Podcast Addict). The Backfill uses it
+instead of speech recognition when one exists.
