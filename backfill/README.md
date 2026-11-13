@@ -112,7 +112,7 @@ Measured on an M-series Mac, November 2026 (word error rate; lower is better):
 |---|---|---|---|
 | Talk Python #559, 68 min, English | **5.3%**, 22x realtime | 10.5%, 42x | 7.6% |
 | Normal Curves, 55 min, English | **11.8%**, 26x | 13.3%, 48x | not run |
-| Puliyabaazi, 33 min, Hindi | 40.5%, 5.5x | no Hindi | not run |
+| Puliyabaazi, 33 min, Hindi | (40.9%), 5.5x | no Hindi | not run |
 
 Whisper is the default because it was the most accurate, and at over 20x realtime an
 hour of audio still takes about three minutes. Parakeet is about twice as fast; part of
@@ -121,8 +121,18 @@ the publishers' transcripts are edited, but it was still less accurate with fill
 removed (8.8% against 5.0% for Talk Python). Choose it with `PA_ASR_BACKEND=parakeet`
 for a faster bulk run; Episodes in languages it lacks still go to Whisper. Qwen3-ASR is
 benchmark-only: it gives one timestamp per 20 minutes, too coarse to cut out ad reads,
-and on the second Episode it looped without finishing. The Hindi figure mostly reflects
-spelling variation against a machine-made reference; the output itself read correctly.
+and on the second Episode it looped without finishing.
+
+The Hindi figure is in brackets because it does not measure accuracy: the publisher's
+machine-made transcript leaves out whole passages and writes English loanwords in Latin
+script, so a more complete transcript scores worse. NVIDIA's
+`nemotron-3.5-asr-streaming-0.6b` (Parakeet's successor family, 40 languages including
+Hindi; `mlx-community/nemotron-3.5-asr-streaming-0.6b-8bit` runs in mlx-audio) "scored"
+50.3% on that reference, yet it missed only 35 of the reference's words where Whisper
+missed 369, and read side by side its Hindi is the more accurate. It is not wired in: in
+English it was less accurate than Whisper (11.9% for Talk Python), and in Hindi it
+returned five "sentences" for 33 minutes, so its timings are too coarse to cut out ad
+reads without re-splitting its output.
 
 ## Outputs
 

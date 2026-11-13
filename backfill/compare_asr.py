@@ -23,6 +23,7 @@ import pathlib
 import re
 import sys
 import time
+import unicodedata
 
 HERE = pathlib.Path(__file__).resolve().parent
 sys.path[:0] = [str(HERE), str(HERE.parent)]
@@ -44,7 +45,11 @@ BENCH = backfill.WORK / "bench"
 
 
 def normalize(text):
-    text = re.sub(r"[^\w\s']", " ", text.lower().replace("’", "'"))
+    """Lowercase, punctuation and symbols removed. Only Unicode P*/S* characters go, so
+    combining marks (Devanagari vowel signs, virama, nukta) stay inside their words."""
+    text = text.lower().replace("’", "'")
+    text = "".join(" " if unicodedata.category(ch)[0] in "PS" and ch != "'" else ch
+                   for ch in text)
     return re.sub(r"\s+", " ", text).strip()
 
 
