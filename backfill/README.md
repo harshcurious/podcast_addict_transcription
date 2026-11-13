@@ -69,13 +69,40 @@ PY=backfill/.venv/bin/python
 
 $PY backfill/backfill.py "$B" --dry-run          # plan: online vs local, hours of audio
 $PY backfill/backfill.py "$B" --online-only      # publisher transcripts only (fast)
-caffeinate -i $PY backfill/backfill.py "$B"      # everything; stop and restart any time
+$PY backfill/backfill.py "$B"                    # everything; stop and restart any time
 $PY backfill/backfill.py --status                # progress and the most common errors
 $PY backfill/backfill.py --flush                 # retry cleaning/retention that failed
 ```
 
 Useful filters: `--limit N`, `--podcast "Talk Python"` (repeatable),
 `--played-since 2026-01-01`, `--episode-id 48935`.
+
+A run keeps the Mac from idle sleep until it ends. Ctrl-C or `kill` (SIGTERM) stops it
+cleanly: the Episode being cleaned is finished, and the rest resume on the next run.
+
+### As a background service
+
+A whole library takes days, so `service.sh` runs the backfill as a macOS LaunchAgent: it
+keeps running with no terminal open, is restarted 5 minutes after a crash, and starts
+again at login until you stop it.
+
+```bash
+backfill/service.sh show "$B"                  # review the LaunchAgent first (optional)
+backfill/service.sh install "$B"               # create it and start; options go after "$B"
+backfill/service.sh status                     # running or not, plus --status
+backfill/service.sh logs                       # follow logs/backfill.log
+backfill/service.sh restart                    # e.g. after editing config.env
+backfill/service.sh stop                       # stays stopped, also across logins
+backfill/service.sh start
+backfill/service.sh uninstall
+```
+
+The LaunchAgent (`~/Library/LaunchAgents/com.podcast-addict.backfill.plist`) points at
+this checkout and its `backfill/.venv` by absolute path, and records your shell's `PATH`
+when you install (launchd's own lacks Homebrew, so `ffmpeg` and `opencode` would not be
+found). Re-run `install` after moving the checkout, changing `PATH`, or to change the
+backup file or options. Output that is not in `backfill.log` (tracebacks) goes to
+`logs/service.log`.
 
 Re-running is always safe. Each Episode's progress is kept in
 `$PA_ROOT/backfill-state/<key>.json`, where the key comes from the feed URL and the item

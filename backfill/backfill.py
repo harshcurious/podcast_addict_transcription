@@ -30,6 +30,9 @@ import os
 import pathlib
 import queue
 import re
+import shutil
+import signal
+import subprocess
 import sys
 import threading
 import time
@@ -456,6 +459,21 @@ def needs_work(record, opts):
 
 # ----------------------------------------------------------------------------- modes
 
+def keep_awake():
+    """Hold off idle sleep until this process exits (macOS `caffeinate -w`)."""
+    if sys.platform == "darwin" and shutil.which("caffeinate"):
+        subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def stop_gracefully_on_sigterm():
+    """launchd stops a job with SIGTERM; treat it like Ctrl-C so the run winds down."""
+    def handler(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)  # a second SIGTERM stops at once
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, handler)
+
+
 def run(opts):
     db = database_path(opts.backup, WORK)
     episodes = list(select(listened_episodes(db), opts))
@@ -475,7 +493,8 @@ def run(opts):
     if opts.dry_run:
         return dry_run(episodes, state, feeds, opts)
 
-    finisher = None if opts.no_postprocess else Finisher(state).start()
+    keep_awake()
+    finisher =None if opts.no_postprocess else Finisher(state).start()
     counts, started = Counter(), 0
     try:
         for ep in episodes:
@@ -586,4 +605,5 @@ def main(opts):
 
 
 if __name__ == "__main__":
+    stop_gracefully_on_sigterm()
     sys.exit(main(ARGS))

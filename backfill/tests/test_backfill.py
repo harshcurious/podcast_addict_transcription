@@ -174,3 +174,16 @@ def test_dry_run_changes_nothing(env, capsys):
     out = capsys.readouterr().out
     assert "1 with an online transcript link" in out and "2 to transcribe locally" in out
     assert states(tmp_path) == {} and hindsight.requests == []
+
+
+def test_sigterm_stops_like_ctrl_c_and_a_second_one_is_not_caught():
+    import os
+    import signal
+    previous = signal.getsignal(signal.SIGTERM)
+    try:
+        backfill.stop_gracefully_on_sigterm()
+        with pytest.raises(KeyboardInterrupt):
+            os.kill(os.getpid(), signal.SIGTERM)
+        assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
+    finally:
+        signal.signal(signal.SIGTERM, previous)
