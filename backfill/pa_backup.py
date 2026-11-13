@@ -41,8 +41,15 @@ class ListenedEpisode:
 
 def database_path(backup, workdir):
     """Return a SQLite path for `backup`, extracting the zip's database once into `workdir`."""
+    given = backup
     backup = pathlib.Path(backup).expanduser().resolve()
+    if not backup.is_file():
+        raise FileNotFoundError(f"backup not found: {given} (looked for {backup})")
     if not zipfile.is_zipfile(backup):
+        with backup.open("rb") as f:
+            if f.read(16) != b"SQLite format 3\x00":
+                raise ValueError(f"{backup} is neither a Podcast Addict backup (zip) "
+                                 "nor a SQLite database")
         return backup
     stat = backup.stat()
     target = pathlib.Path(workdir) / f"{backup.stem}-{int(stat.st_mtime)}-{stat.st_size}.db"

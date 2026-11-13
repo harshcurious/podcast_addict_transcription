@@ -577,6 +577,11 @@ def main(opts):
     if not opts.backup:
         print("error: BACKUP is required (or use --status / --flush)", file=sys.stderr)
         return 2
+    try:
+        database_path(opts.backup, WORK)  # check the backup before any other work
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     return run(opts)
 
 

@@ -2,6 +2,8 @@ import json
 import sqlite3
 import zipfile
 
+import pytest
+
 from pa_backup import database_path, listened_episodes, parse_transcript_urls
 
 FEED = "https://example.com/feed.xml"
@@ -71,6 +73,24 @@ def test_backup_zip_is_extracted_once(tmp_path):
     assert db.parent == tmp_path / "work" and db.exists()
     assert database_path(backup, tmp_path / "work") == db
     assert len(listened_episodes(db)) == 3
+
+
+def test_plain_sqlite_database_is_used_in_place(tmp_path):
+    make_db(tmp_path / "podcastAddict.db")
+    assert database_path(tmp_path / "podcastAddict.db", tmp_path / "work") == \
+        tmp_path / "podcastAddict.db"
+
+
+def test_missing_backup_is_reported_by_name(tmp_path):
+    with pytest.raises(FileNotFoundError, match="backup not found: backup/missing.backup"):
+        database_path("backup/missing.backup", tmp_path / "work")
+
+
+def test_file_that_is_neither_zip_nor_sqlite_is_rejected(tmp_path):
+    junk = tmp_path / "notes.backup"
+    junk.write_text("not a backup")
+    with pytest.raises(ValueError, match="neither"):
+        database_path(junk, tmp_path / "work")
 
 
 def test_transcript_url_formats():
