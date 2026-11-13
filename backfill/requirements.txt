@@ -1,5 +1,12 @@
 # Mac-only backfill environment (backfill/.venv). The Pi service does not use this file.
 mlx-whisper>=0.4,<1; sys_platform == "darwin" and platform_machine == "arm64"
+parakeet-mlx>=0.7,<1; sys_platform == "darwin" and platform_machine == "arm64"
 faster-whisper>=1.2,<2; sys_platform != "darwin" or platform_machine != "arm64"
 numpy>=2,<3
 pytest>=8
+
+# Optional:
+#   mlx-lm      a local ad-classifier model behind mlx_lm.server (PA_CLEAN_BACKEND=openai)
+#   jiwer       word error rate in compare_asr.py
+#   mlx-audio   the qwen3-asr engine in compare_asr.py
+# uv pip install --python backfill/.venv/bin/python mlx-lm jiwer mlx-audio

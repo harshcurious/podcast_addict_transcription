@@ -12,8 +12,9 @@ For each listened Episode, most recently played first:
    `<podcast:transcript>` tags in the Episode's live RSS feed. JSON, WebVTT, SRT, HTML and
    plain-text transcripts are all accepted. A file too short for the episode length (a
    summary rather than a transcript) is rejected.
-2. **Otherwise, transcribe on this Mac.** It downloads the audio and runs mlx-whisper
-   (`whisper-large-v3-turbo` on the GPU) or faster-whisper, then deletes the audio.
+2. **Otherwise, transcribe on this Mac.** It downloads the audio, transcribes it with
+   Whisper `large-v3-turbo` on the Apple-silicon GPU (mlx-whisper), then deletes the
+   audio. See [Choosing the speech-recognition engine](#choosing-the-speech-recognition-engine).
 3. **Remove ad reads** with the pipeline's own classifier (`clean_transcript_ai.py`). Only
    segment IDs come back from the model; the raw transcript is never rewritten. This step
    fails closed: if cleaning fails, nothing is retained.
@@ -35,12 +36,28 @@ $EDITOR backfill/config.env         # PA_ROOT, PA_HINDSIGHT_URL, cleaner models
 `backfill.py` loads `backfill/config.env` by itself; environment variables override it.
 
 - **Speech recognition:** `ffmpeg` must be installed (`brew install ffmpeg`). The first run
-  downloads the Whisper model (about 1.6 GB) from Hugging Face.
-- **Ad cleaner:** uses Hermes when installed (as the Pi does), otherwise `opencode run`.
-  For opencode, the classifier runs as an inline agent with every tool disabled and every
-  permission denied, in an empty directory, because the prompt contains untrusted
-  transcript text. Choose models your provider actually offers:
-  `opencode models | grep opencode-go/`.
+  downloads the Whisper model (about 1.6 GB) from Hugging Face; Parakeet, if you choose it,
+  is another 2.5 GB.
+- **Ad cleaner:** `PA_CLEAN_BACKEND` picks how the classifier model is reached. The
+  prompt contains untrusted transcript text, so no backend gives the model tools.
+  - `openai`: one HTTP request per transcript chunk to any OpenAI-compatible endpoint
+    (OpenRouter, Groq, a provider's own API, or a local `mlx_lm.server`). Set
+    `PA_CLEAN_API_URL`, `PA_CLEAN_API_KEY` and the provider's model names in
+    `PA_CLEAN_MODEL` / `PA_CLEAN_FALLBACK_MODELS`. A local model keeps the text on the
+    Mac, but it must be strong enough to follow the classifier's rules: tested on a 24 GB
+    Mac, `mlx-community/Qwen3.5-9B-MLX-4bit` found the right ads but also listed context
+    segments it was told to leave alone, so every chunk was rejected (the cleaner fails
+    closed); with thinking enabled it took over 7 minutes for one chunk.
+  - `hermes`: the Hermes CLI, as on the Pi.
+  - `opencode`: `opencode run`. Choose models your provider offers
+    (`opencode models | grep opencode-go/`). It runs with an empty private config
+    directory, so your global opencode plugins (including the Hindsight plugin, which
+    would otherwise record every classifier call as a coding session), MCP servers and
+    `AGENTS.md` are not loaded. The classifier is an inline agent with every tool
+    disabled and every permission denied. Older opencode builds without `--archived`
+    work too. `PA_CLEAN_OPENCODE` pins a binary when several are installed.
+  - `auto` (default): `openai` when `PA_CLEAN_API_URL` is set, else Hermes if
+    installed, else opencode.
 - **Hindsight:** point `PA_HINDSIGHT_URL` at the instance that holds the Pi's bank, for
   example its Tailscale HTTPS name.
 
@@ -77,6 +94,35 @@ Ad cleaning stops for the rest of a run after `PA_BACKFILL_MAX_CLEAN_FAILURES` f
 a row (for example, the model endpoint is down), but transcription carries on;
 `--flush` finishes those Episodes later. When Hindsight is unreachable, retain requests
 stay in `hindsight-pending/` and are re-sent at the end of the run and by `--flush`.
+
+## Choosing the speech-recognition engine
+
+`PA_ASR_BACKEND` picks the engine: `auto` (Whisper on the GPU; the default), `whisper`,
+`faster-whisper` (CPU) or `parakeet`. `compare_asr.py` measures them on your own Episodes
+against the publishers' transcripts:
+
+```bash
+uv pip install --python backfill/.venv/bin/python jiwer
+backfill/.venv/bin/python backfill/compare_asr.py "$B" --episode-id 48935 --episode-id 47871
+```
+
+Measured on an M-series Mac, November 2026 (word error rate; lower is better):
+
+| Episode | Whisper large-v3-turbo | Parakeet TDT 0.6B v3 | Qwen3-ASR 1.7B |
+|---|---|---|---|
+| Talk Python #559, 68 min, English | **5.3%**, 22x realtime | 10.5%, 42x | 7.6% |
+| Normal Curves, 55 min, English | **11.8%**, 26x | 13.3%, 48x | not run |
+| Puliyabaazi, 33 min, Hindi | 40.5%, 5.5x | no Hindi | not run |
+
+Whisper is the default because it was the most accurate, and at over 20x realtime an
+hour of audio still takes about three minutes. Parakeet is about twice as fast; part of
+its higher error rate is that it is verbatim ("uh", "um", "you know", false starts) where
+the publishers' transcripts are edited, but it was still less accurate with fillers
+removed (8.8% against 5.0% for Talk Python). Choose it with `PA_ASR_BACKEND=parakeet`
+for a faster bulk run; Episodes in languages it lacks still go to Whisper. Qwen3-ASR is
+benchmark-only: it gives one timestamp per 20 minutes, too coarse to cut out ad reads,
+and on the second Episode it looped without finishing. The Hindi figure mostly reflects
+spelling variation against a machine-made reference; the output itself read correctly.
 
 ## Outputs
 

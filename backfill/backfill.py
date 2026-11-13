@@ -30,8 +30,6 @@ import os
 import pathlib
 import queue
 import re
-import shutil
-import subprocess
 import sys
 import threading
 import time
@@ -40,24 +38,9 @@ from collections import Counter
 
 HERE = pathlib.Path(__file__).resolve().parent
 REPO = HERE.parent
-CLASSIFIER_AGENT = "pa-ad-classifier"
-ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 LANG_CODES = {"english": "en", "hindi": "hi", "spanish": "es", "french": "fr", "german": "de",
               "italian": "it", "portuguese": "pt", "dutch": "nl", "japanese": "ja",
               "chinese": "zh", "korean": "ko", "russian": "ru", "arabic": "ar"}
-
-
-def load_env_file(path):
-    """KEY=VALUE lines; variables already set in the environment win."""
-    path = pathlib.Path(path)
-    if not path.exists():
-        return
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, _, value = line.partition("=")
-        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
 
 
 def parse_args(argv=None):
@@ -89,20 +72,21 @@ def parse_args(argv=None):
     return ap.parse_args(argv)
 
 
+sys.path[:0] = [str(HERE), str(REPO)]
 ARGS = parse_args() if __name__ == "__main__" else None
 if ARGS is not None:
-    load_env_file(ARGS.env_file)
+    import envfile
+    envfile.load(ARGS.env_file)
 os.environ.setdefault("PA_ROOT", str(pathlib.Path("~/podcast-backfill").expanduser()))
 os.environ.setdefault("PA_OUTDIR", str(pathlib.Path(os.environ["PA_ROOT"]) / "out"))
-sys.path[:0] = [str(HERE), str(REPO)]
 
 # The Pi pipeline's modules read PA_* at import, so they are imported only now.
+import ai_backends  # noqa: E402
 import hindsight_save  # noqa: E402
 import publisher_transcripts as online  # noqa: E402
 from clean_transcript_ai import (  # noqa: E402
     CleanerConfig,
     clean,
-    hermes_ask,
     is_reusable,
     write_outputs,
 )
@@ -239,9 +223,12 @@ def from_audio(ep, recognizer, keep_audio):
         raise RuntimeError("Episode has no downloadable audio URL")
     from mac_asr import download
     audio, sha, size = download(ep.audio_url, WORK / "audio", ep.key, max_bytes=MAX_AUDIO_BYTES)
+    language = language_code(ep)
     try:
-        log(f"  transcribing {size / 2**20:.0f} MB with {recognizer.backend}/{recognizer.model}")
-        segments, info = recognizer.transcribe(audio, language_code(ep))
+        engine, model = recognizer.describe(language)
+        log(f"  transcribing {size / 2**20:.0f} MB ({language or 'language unknown'}) "
+            f"with {engine} {model}")
+        segments, info = recognizer.transcribe(audio, language)
     finally:
         if not keep_audio:
             audio.unlink(missing_ok=True)
@@ -249,11 +236,11 @@ def from_audio(ep, recognizer, keep_audio):
     if words < online.MIN_WORDS:
         raise RuntimeError(f"speech recognition produced only {words} words")
     meta = {**base_meta(ep),
-            "file_bytes": size, "audio_duration": info["duration"], "model": recognizer.model,
+            "file_bytes": size, "audio_duration": info["duration"], "model": info["model"],
             "language": info["language"], "transcribed_at": now(), "rtf": info["rtf"],
             "wall_seconds": info["wall_seconds"], "audio_sha256": sha,
             "segments": len(segments), "words": words, "transcript_source": "asr",
-            "asr_backend": recognizer.backend, "timing": "exact"}
+            "asr_backend": info["engine"], "timing": "exact"}
     return meta, segments
 
 
@@ -286,41 +273,9 @@ def obtain(ep, record, feeds, recognizer, opts):
 
 # ---------------------------------------------------------------- cleaning + retention
 
-def opencode_ask(config, opencode_path):
-    """`ask_model` through `opencode run`, for machines without Hermes.
-
-    The prompt carries untrusted transcript text, so the agent is defined inline with every
-    permission denied and every tool disabled, and runs in an empty directory."""
-    agent = {"agent": {CLASSIFIER_AGENT: {
-        "mode": "primary", "description": "tool-less podcast ad-segment classifier",
-        "permission": {"*": "deny"}, "tools": {"*": False}}}}
-    env = {**os.environ, "OPENCODE_CONFIG_CONTENT": json.dumps(agent)}
-    cwd = WORK / "opencode-empty"
-
-    def ask(prompt, model):
-        cwd.mkdir(parents=True, exist_ok=True)
-        cmd = [opencode_path, "run", "--standalone", "--archived", "--agent", CLASSIFIER_AGENT,
-               "-m", f"{config.provider}/{model}", prompt]
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=config.timeout,
-                              cwd=cwd, env=env)
-        out = ANSI.sub("", proc.stdout or "")
-        if proc.returncode or "Error:" in out[:200]:
-            raise RuntimeError(f"opencode rc={proc.returncode}: "
-                               f"{ANSI.sub('', proc.stderr or out)[-800:]}")
-        return out
-
-    return ask
-
-
 def cleaner_backend(config):
-    """The `ask_model` named by PA_CLEAN_BACKEND: hermes | opencode | auto (default)."""
-    choice = os.environ.get("PA_CLEAN_BACKEND", "auto")
-    opencode_path = os.environ.get("PA_CLEAN_OPENCODE") or shutil.which("opencode")
-    if choice == "hermes" or (choice == "auto" and os.access(config.hermes_path, os.X_OK)):
-        return "hermes", hermes_ask(config)
-    if choice in ("opencode", "auto") and opencode_path:
-        return "opencode", opencode_ask(config, opencode_path)
-    raise RuntimeError("no AI cleaner: install Hermes or opencode, or set PA_CLEAN_BACKEND")
+    """(name, ask_model) for the configured AI cleaner; see ai_backends."""
+    return ai_backends.choose(config, WORK)
 
 
 def queue_retain(transcript, record):
@@ -514,7 +469,6 @@ def run(opts):
         if not recognizer_box:
             from mac_asr import Recognizer
             recognizer_box.append(Recognizer(os.environ.get("PA_ASR_BACKEND", "auto"),
-                                              os.environ.get("PA_ASR_MODEL", ""),
                                               beam=int(os.environ.get("PA_BEAM", "1"))))
         return recognizer_box[0]
 
