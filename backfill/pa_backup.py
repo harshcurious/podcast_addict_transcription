@@ -7,6 +7,7 @@ or its listening history records a completed play. Standard library only.
 import datetime as dt
 import hashlib
 import json
+import os
 import pathlib
 import shutil
 import sqlite3
@@ -60,7 +61,7 @@ def database_path(backup, workdir):
         names = [n for n in archive.namelist() if pathlib.PurePosixPath(n).name == DB_MEMBER]
         if not names:
             raise ValueError(f"{backup} contains no {DB_MEMBER}")
-        tmp = target.with_suffix(".tmp")
+        tmp = target.with_suffix(f".{os.getpid()}.tmp")  # a --dry-run may extract it too
         with archive.open(names[0]) as src, tmp.open("wb") as dst:
             shutil.copyfileobj(src, dst, 1024 * 1024)
         tmp.replace(target)

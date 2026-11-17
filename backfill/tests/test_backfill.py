@@ -286,3 +286,49 @@ def test_titles_in_any_script_keep_their_identity():
         backfill.identity("पुलियाबाज़ी", "दूसरा एपिसोड")
     assert backfill.identity("Show", "Ep. One!") == backfill.identity("show", "ep one")
     assert backfill.identity("Show", "  ") is None
+
+
+def test_a_failed_refresh_keeps_the_retained_episode(env, monkeypatch):
+    tmp_path, _, _ = env
+    run(tmp_path, "--episode-id", "2")
+
+    def broken(ep, recognizer, keep_audio):
+        raise RuntimeError("HTTP 404")
+    monkeypatch.setattr(backfill, "from_audio", broken)
+    run(tmp_path, "--episode-id", "2", "--force")
+    record = states(tmp_path)["Played late"]
+    assert record["status"] == "retained" and "refresh failed" in record["error"]
+
+
+def test_a_failed_attempt_never_reuses_its_leftover_transcript(env, monkeypatch):
+    tmp_path, hindsight, _ = env
+    run(tmp_path, "--episode-id", "2", "--no-postprocess")
+    record = states(tmp_path)["Played late"]
+    backfill.pathlib.Path(record["transcript_json"]).write_text("{half writ")
+    record.update(status="failed", attempts=1)
+    backfill.State(tmp_path / "state").put(record)
+
+    assert run(tmp_path, "--episode-id", "2") == 0
+    assert states(tmp_path)["Played late"]["status"] == "retained"
+
+
+def test_flush_with_dry_run_still_takes_the_lock(env, monkeypatch):
+    tmp_path, _, _ = env
+    monkeypatch.setattr(backfill, "LOCK_PATH", tmp_path / "backfill.lock")
+    with backfill.runtime_lock():
+        assert backfill.main(backfill.parse_args(
+            ["--flush", "--dry-run", "--env-file", "/x"])) == 2
+
+
+def test_hindsight_list_without_a_total_is_read_to_the_end(monkeypatch):
+    base = (f"{hindsight_save.API_URL}/v1/default/banks/{hindsight_save.BANK_ID}"
+            "/documents?limit=100&offset=")
+
+    def doc(i):
+        return {"id": f"podcast:{i:064d}", "retain_params": {"metadata": {
+            "show": "Show", "title": f"Episode {i}"}}}
+    monkeypatch.setattr(online, "http_get", web({
+        base + "0": json.dumps({"items": [doc(i) for i in range(100)]}).encode(),
+        base + "100": json.dumps({"items": [doc(100)]}).encode(),
+        base + "101": json.dumps({"items": []}).encode()}))
+    assert len(backfill.already_in_hindsight()) == 101

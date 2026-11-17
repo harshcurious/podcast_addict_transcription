@@ -438,7 +438,7 @@ def already_in_hindsight():
                     not doc["id"].startswith("podcast:episode:"):
                 seen.add(identity(meta.get("show", ""), meta.get("title", "")))
         offset += len(page.get("items", []))
-        if not page.get("items") or offset >= page.get("total", 0):
+        if not page.get("items") or ("total" in page and offset >= page["total"]):
             seen.discard(None)
             return seen
 
@@ -543,8 +543,9 @@ def run(opts):
                 break
             started += 1
             log(f"[{started}] {ep.podcast} — {ep.title} (played {ep.played_at[:10]})")
-            have = record.get("transcript_json") and pathlib.Path(
-                record["transcript_json"]).exists()
+            # A failed attempt may have left a partly written transcript: make it again.
+            have = record.get("status") != "failed" and record.get("transcript_json") \
+                and pathlib.Path(record["transcript_json"]).exists()
             if opts.force or not have:
                 # Count the attempt first, so an Episode that crashes or kills the process
                 # (out of memory, an ASR crash) is given up after --max-attempts as well.
@@ -558,8 +559,12 @@ def run(opts):
                     state.put(before)  # stopped on purpose: not a failed attempt
                     raise
                 except Exception as exc:
-                    record.update(status="failed", error=str(exc)[:500])
                     log(f"ERROR no transcript: {exc}")
+                    if before.get("status") == "retained":  # a --force refresh: keep the old
+                        state.put({**before, "error": f"refresh failed: {exc}"[:500]})
+                        counts["refresh_failed"] += 1
+                        continue
+                    record.update(status="failed", error=str(exc)[:500])
                 else:
                     record.pop("attempts", None)
                 state.put(record)
@@ -651,7 +656,8 @@ def main(opts):
     if not opts.flush and not opts.backup:
         print("error: BACKUP is required (or use --status / --flush)", file=sys.stderr)
         return 2
-    with (contextlib.nullcontext(True) if opts.dry_run else runtime_lock()) as alone:
+    preview = opts.dry_run and not opts.flush
+    with (contextlib.nullcontext(True) if preview else runtime_lock()) as alone:
         if not alone:
             print(f"error: another backfill is already running on {ROOT} "
                   "(the service? see backfill/service.sh status)", file=sys.stderr)
@@ -668,4 +674,7 @@ def main(opts):
 
 if __name__ == "__main__":
     stop_gracefully_on_sigterm()
-    sys.exit(main(ARGS))
+    try:
+        sys.exit(main(ARGS))
+    except KeyboardInterrupt:  # stopped before the run's own handling began
+        sys.exit(130)

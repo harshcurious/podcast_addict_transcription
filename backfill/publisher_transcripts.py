@@ -11,6 +11,7 @@ import hashlib
 import html
 import html.parser
 import json
+import os
 import pathlib
 import re
 import time
@@ -22,6 +23,7 @@ USER_AGENT = "pa-transcript-backfill/1.0"
 PREFERENCE = ("json", "vtt", "srt", "html", "text")
 WORDS_PER_SECOND = 2.5          # ~150 wpm, used only to estimate missing timings
 MIN_WORDS = 50
+CHROME_WORDS = 12              # an out-of-order timed cue this short is a badge or player
 MIN_COVERAGE = 0.2              # transcript must hold >= 20% of the words a talk of that
                                 # length would; shorter files are summaries, not transcripts
 
@@ -166,8 +168,8 @@ class _Blocks(html.parser.HTMLParser):
 
 def parse_blocks(blocks):
     """Text blocks -> cues. A block that is only a timestamp or only `Name:` applies to the
-    next block. If any block carries a timestamp, untimed blocks between timed ones continue
-    the cue before them, and untimed blocks around the transcript are page chrome."""
+    next block. If any block carries a timestamp, untimed blocks after the first timed one
+    continue the cue before them, and untimed blocks before it are page chrome."""
     cues, pending_time, pending_speaker = [], None, ""
     for block in blocks:
         if _CUE_TIME.fullmatch(block.strip("[]() ")):
@@ -187,7 +189,7 @@ def parse_blocks(blocks):
     timed = [i for i, c in enumerate(cues) if c["start"] is not None]
     if timed:
         kept = []
-        for c in cues[timed[0]:timed[-1] + 1]:
+        for c in cues[timed[0]:]:
             if c["start"] is not None:
                 kept.append(c)
             else:  # a paragraph continuing the timed cue before it
@@ -196,10 +198,13 @@ def parse_blocks(blocks):
                                            else c["text"])
         cues = kept
         # Page chrome around the transcript (a duration badge, a player) can carry a
-        # timestamp too; it is out of order with the transcript next to it.
-        while len(cues) > 1 and cues[0]["start"] > cues[1]["start"]:
+        # timestamp too: a short cue out of order with the transcript next to it.
+        def chrome(c, neighbour, later):
+            return len(c["text"].split()) <= CHROME_WORDS and (
+                c["start"] > neighbour["start"] if later else c["start"] < neighbour["start"])
+        while len(cues) > 1 and chrome(cues[0], cues[1], later=True):
             cues.pop(0)
-        while len(cues) > 1 and cues[-1]["start"] < cues[-2]["start"]:
+        while len(cues) > 1 and chrome(cues[-1], cues[-2], later=False):
             cues.pop()
     return cues
 
@@ -273,20 +278,24 @@ def _split_long(cue, max_chars):
     """Split a cue longer than max_chars at sentence ends (or words), sharing its time."""
     if len(cue["text"]) <= max_chars:
         return [cue]
+    units = []  # pieces of the text, whitespace kept, none longer than max_chars
+    for sentence in re.split(r"(?<=[.!?।。！？])", cue["text"]):
+        for word in (re.findall(r"\s*\S+", sentence) if len(sentence) > max_chars
+                     else [sentence]):
+            units += [word[i:i + max_chars] for i in range(0, len(word), max_chars)]
     pieces, current = [], ""
-    for sentence in re.split(r"(?<=[.!?।])\s+", cue["text"]):
-        for unit in (sentence.split() if len(sentence) > max_chars else [sentence]):
-            if current and len(current) + 1 + len(unit) > max_chars:
-                pieces.append(current)
-                current = unit
-            else:
-                current = f"{current} {unit}" if current else unit
-    if current:
-        pieces.append(current)
-    total = sum(len(p.split()) for p in pieces)
+    for unit in units:
+        if current.strip() and len(current) + len(unit) > max_chars:
+            pieces.append(current.strip())
+            current = unit
+        else:
+            current += unit
+    if current.strip():
+        pieces.append(current.strip())
+    total = sum(len(p) for p in pieces)
     clock, span, out = cue["start"], cue["end"] - cue["start"], []
     for piece in pieces:
-        end = clock + span * len(piece.split()) / total
+        end = clock + span * len(piece) / total
         out.append({**cue, "start": clock, "end": end, "text": piece})
         clock = end
     return out
@@ -315,7 +324,7 @@ class FeedIndex:
             return path.read_bytes()
         body, _ = self._get(feed_url)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")  # a --dry-run may fetch it too
         tmp.write_bytes(body)
         tmp.replace(path)
         return body

@@ -88,17 +88,21 @@ def test_html_page_chrome_is_dropped_when_the_transcript_is_timed():
 
 
 
-def test_untimed_paragraphs_between_timed_ones_continue_the_cue_before():
-    cues = pt.parse_text("[00:10] Alice: first part.\n\nand its continuation.\n\n"
-                         "Bob:\n\nreply without a time.\n\n[00:20] Alice: next.\n\nFooter")
+def test_untimed_paragraphs_after_a_timed_one_continue_it():
+    cues = pt.parse_text("Site menu\n\n[00:10] Alice: first part.\n\nand its continuation."
+                         "\n\nBob:\n\nreply without a time.\n\n[00:20] Alice: next.\n\n"
+                         "the last turn goes on.")
     assert [(c["start"], c["text"]) for c in cues] == [
         (10, "Alice: first part. and its continuation. Bob: reply without a time."),
-        (20, "Alice: next.")]
+        (20, "Alice: next. the last turn goes on.")]
 
 
 def test_a_player_timestamp_after_the_transcript_does_not_cut_it():
     cues = pt.parse_text("[00:15] Hello.\n\n[00:30] More.\n\n[00:00] Related episode")
     assert [c["text"] for c in cues] == ["Hello.", "More."]
+    body = " ".join(["Welcome to the show, today we talk."] * 10)
+    cues = pt.parse_text(f"[00:15] {body}\n\n[00:00] Play")
+    assert [c["text"] for c in cues] == [body]
 
 
 def test_untimed_text_gets_estimated_times_spread_over_the_duration():
@@ -193,3 +197,9 @@ def test_a_one_paragraph_transcript_is_split_so_an_ad_cannot_take_it_all():
     assert " ".join(s["text"] for s in segments) == text
     assert (segments[0]["start"], segments[-1]["end"]) == (0, 1000)
     assert all(a["end"] == b["start"] for a, b in zip(segments, segments[1:]))
+
+
+def test_text_without_spaces_is_split_too():
+    text = "これは文です。" * 1000
+    segments, _ = pt.to_segments([{"start": 0, "end": 100, "text": text, "speaker": ""}])
+    assert len(segments) > 5 and all(len(s["text"]) <= 2 * 400 for s in segments)

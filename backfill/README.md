@@ -78,7 +78,8 @@ Useful filters: `--limit N`, `--podcast "Talk Python"` (repeatable),
 `--played-since 2026-01-01`, `--episode-id 48935`.
 
 A run keeps the Mac from idle sleep until it ends. Ctrl-C or `kill` (SIGTERM) stops it
-cleanly: the Episode being cleaned is finished, and the rest resume on the next run.
+cleanly: the Episode being cleaned is finished, and the rest resume on the next run. Under
+the service, only `service.sh stop` keeps it stopped; launchd restarts a killed run.
 
 ### As a background service
 
