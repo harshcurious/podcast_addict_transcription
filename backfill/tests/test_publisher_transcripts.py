@@ -206,6 +206,6 @@ def test_text_without_spaces_is_split_too():
 
 
 def test_unspaced_scripts_count_a_word_per_character():
-    assert pt.count_words("Hello there, 世界です。") == 2 + 5
+    assert pt.count_words("Hello there, 世界です。 — ok") == 2 + 4 + 1
     segments = [{"start": 0, "end": 600, "text": "これは文です。" * 300}]
     assert pt.is_plausible(segments, 600)[0]

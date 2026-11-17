@@ -29,11 +29,12 @@ MIN_COVERAGE = 0.2              # transcript must hold >= 20% of the words a tal
 
 
 _UNSPACED = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"  # kana and Han
-_WORD = re.compile(f"[{_UNSPACED}]|[^\\s{_UNSPACED}]+")
+_WORD = re.compile(f"[{_UNSPACED}]|[^\\s{_UNSPACED}]*\\w[^\\s{_UNSPACED}]*")
 
 
 def count_words(text):
-    """Words in `text`, counting each Chinese or Japanese character as one (written unspaced)."""
+    """Words in `text`, counting each Chinese or Japanese character as one (written unspaced).
+    Punctuation on its own (。, —) is not a word."""
     return len(_WORD.findall(text))
 
 

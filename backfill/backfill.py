@@ -432,15 +432,19 @@ def already_in_hindsight():
                f"/documents?limit=100&offset={offset}")
         body, _ = online.http_get(url, timeout=hindsight_save.TIMEOUT)
         page = json.loads(body)
-        new = {doc.get("id") for doc in page.get("items", [])} - ids
+        items = page.get("items", [])
+        new = {doc.get("id") for doc in items} - ids
+        if items and not new:
+            raise RuntimeError(f"Hindsight sent the same documents again at offset {offset}: "
+                               "its paging is not working, so the list is incomplete")
         ids |= new
-        for doc in page.get("items", []):
+        for doc in items:
             meta = (doc.get("retain_params") or {}).get("metadata") or {}
             if doc.get("id", "").startswith("podcast:") and \
                     not doc["id"].startswith("podcast:episode:"):
                 seen.add(identity(meta.get("show", ""), meta.get("title", "")))
-        offset += len(page.get("items", []))
-        if not new or ("total" in page and offset >= page["total"]):  # not new: no paging
+        offset += len(items)
+        if not items or ("total" in page and offset >= page["total"]):
             seen.discard(None)
             return seen
 
