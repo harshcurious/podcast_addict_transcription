@@ -239,7 +239,7 @@ def from_audio(ep, recognizer, keep_audio):
     finally:
         if not keep_audio:
             audio.unlink(missing_ok=True)
-    words = sum(len(s["text"].split()) for s in segments)
+    words = sum(online.count_words(s["text"]) for s in segments)
     if words < online.MIN_WORDS:
         raise RuntimeError(f"speech recognition produced only {words} words")
     meta = {**base_meta(ep),
@@ -426,19 +426,21 @@ def already_in_hindsight():
 
     Raises if the list cannot be read: carrying on would transcribe the Pi's Episodes again.
     """
-    seen, offset = set(), 0
+    seen, ids, offset = set(), set(), 0
     while True:
         url = (f"{hindsight_save.API_URL}/v1/default/banks/{hindsight_save.BANK_ID}"
                f"/documents?limit=100&offset={offset}")
         body, _ = online.http_get(url, timeout=hindsight_save.TIMEOUT)
         page = json.loads(body)
+        new = {doc.get("id") for doc in page.get("items", [])} - ids
+        ids |= new
         for doc in page.get("items", []):
             meta = (doc.get("retain_params") or {}).get("metadata") or {}
             if doc.get("id", "").startswith("podcast:") and \
                     not doc["id"].startswith("podcast:episode:"):
                 seen.add(identity(meta.get("show", ""), meta.get("title", "")))
         offset += len(page.get("items", []))
-        if not page.get("items") or ("total" in page and offset >= page["total"]):
+        if not new or ("total" in page and offset >= page["total"]):  # not new: no paging
             seen.discard(None)
             return seen
 

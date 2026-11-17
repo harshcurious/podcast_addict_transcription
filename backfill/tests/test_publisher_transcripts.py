@@ -203,3 +203,9 @@ def test_text_without_spaces_is_split_too():
     text = "これは文です。" * 1000
     segments, _ = pt.to_segments([{"start": 0, "end": 100, "text": text, "speaker": ""}])
     assert len(segments) > 5 and all(len(s["text"]) <= 2 * 400 for s in segments)
+
+
+def test_unspaced_scripts_count_a_word_per_character():
+    assert pt.count_words("Hello there, 世界です。") == 2 + 5
+    segments = [{"start": 0, "end": 600, "text": "これは文です。" * 300}]
+    assert pt.is_plausible(segments, 600)[0]

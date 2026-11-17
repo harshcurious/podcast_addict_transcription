@@ -62,9 +62,12 @@ def database_path(backup, workdir):
         if not names:
             raise ValueError(f"{backup} contains no {DB_MEMBER}")
         tmp = target.with_suffix(f".{os.getpid()}.tmp")  # a --dry-run may extract it too
-        with archive.open(names[0]) as src, tmp.open("wb") as dst:
-            shutil.copyfileobj(src, dst, 1024 * 1024)
-        tmp.replace(target)
+        try:
+            with archive.open(names[0]) as src, tmp.open("wb") as dst:
+                shutil.copyfileobj(src, dst, 1024 * 1024)
+            tmp.replace(target)
+        finally:
+            tmp.unlink(missing_ok=True)  # an interrupted copy; gone already after replace
     return target
 
 

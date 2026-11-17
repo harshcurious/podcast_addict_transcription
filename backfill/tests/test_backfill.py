@@ -332,3 +332,10 @@ def test_hindsight_list_without_a_total_is_read_to_the_end(monkeypatch):
         base + "100": json.dumps({"items": [doc(100)]}).encode(),
         base + "101": json.dumps({"items": []}).encode()}))
     assert len(backfill.already_in_hindsight()) == 101
+
+
+def test_hindsight_list_that_ignores_offset_is_not_read_forever(monkeypatch):
+    page = json.dumps({"items": [{"id": "podcast:" + "f" * 64, "retain_params": {
+        "metadata": {"show": "Show", "title": "Only"}}}]}).encode()
+    monkeypatch.setattr(online, "http_get", lambda url, **_: (page, ""))
+    assert backfill.already_in_hindsight() == {backfill.identity("Show", "Only")}

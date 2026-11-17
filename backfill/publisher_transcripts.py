@@ -28,6 +28,15 @@ MIN_COVERAGE = 0.2              # transcript must hold >= 20% of the words a tal
                                 # length would; shorter files are summaries, not transcripts
 
 
+_UNSPACED = "\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff"  # kana and Han
+_WORD = re.compile(f"[{_UNSPACED}]|[^\\s{_UNSPACED}]+")
+
+
+def count_words(text):
+    """Words in `text`, counting each Chinese or Japanese character as one (written unspaced)."""
+    return len(_WORD.findall(text))
+
+
 class NoTranscript(Exception):
     """No usable transcript was found online for this Episode."""
 
@@ -200,7 +209,7 @@ def parse_blocks(blocks):
         # Page chrome around the transcript (a duration badge, a player) can carry a
         # timestamp too: a short cue out of order with the transcript next to it.
         def chrome(c, neighbour, later):
-            return len(c["text"].split()) <= CHROME_WORDS and (
+            return count_words(c["text"]) <= CHROME_WORDS and (
                 c["start"] > neighbour["start"] if later else c["start"] < neighbour["start"])
         while len(cues) > 1 and chrome(cues[0], cues[1], later=True):
             cues.pop(0)
@@ -235,18 +244,18 @@ def to_segments(cues, duration=0.0, *, max_chars=400, min_chars=120):
         return [], "exact"
     estimated = any(c["start"] is None for c in cues)
     if estimated:
-        total_words = sum(len(c["text"].split()) for c in cues)
+        total_words = sum(count_words(c["text"]) for c in cues)
         scale = (duration / total_words) if duration and total_words else 1 / WORDS_PER_SECOND
         clock = 0.0
         for c in cues:
             c["start"] = clock
-            clock += len(c["text"].split()) * scale
+            clock += count_words(c["text"]) * scale
             c["end"] = clock
     for i, c in enumerate(cues):
         if c.get("end") is None or c["end"] < c["start"]:
             nxt = cues[i + 1]["start"] if i + 1 < len(cues) else None
             c["end"] = nxt if nxt is not None and nxt >= c["start"] else \
-                c["start"] + len(c["text"].split()) / WORDS_PER_SECOND
+                c["start"] + count_words(c["text"]) / WORDS_PER_SECOND
     # Cleaning removes whole Segments, so no Segment may be much longer than max_chars:
     # a one-paragraph transcript would otherwise go entirely with its sponsor read.
     cues = [piece for c in cues for piece in _split_long(c, max_chars)]
@@ -302,7 +311,7 @@ def _split_long(cue, max_chars):
 
 
 def is_plausible(segments, duration):
-    words = sum(len(s["text"].split()) for s in segments)
+    words = sum(count_words(s["text"]) for s in segments)
     expected = duration * WORDS_PER_SECOND * MIN_COVERAGE if duration else 0
     return words >= max(MIN_WORDS, expected), words
 
