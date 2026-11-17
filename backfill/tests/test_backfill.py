@@ -187,3 +187,102 @@ def test_sigterm_stops_like_ctrl_c_and_a_second_one_is_not_caught():
         assert signal.getsignal(signal.SIGTERM) == signal.SIG_DFL
     finally:
         signal.signal(signal.SIGTERM, previous)
+
+
+def test_force_redoes_backfill_episodes_but_never_the_pis(env):
+    tmp_path, hindsight, _ = env
+    run(tmp_path)
+    sent = len(hindsight.requests)
+    assert run(tmp_path, "--force") == 0
+    titles = [d["metadata"]["title"] for d in hindsight.documents()[sent:]]
+    assert sorted(titles) == ["Played early", "Played late"]
+    assert states(tmp_path)["Completed, not marked"]["status"] == "pi-pipeline"
+
+
+def test_unreadable_hindsight_list_stops_the_run(env, monkeypatch):
+    tmp_path, hindsight, _ = env
+    monkeypatch.setattr(online, "http_get", web({}))
+    assert run(tmp_path) == 1
+    assert states(tmp_path) == {} and hindsight.requests == []
+
+
+def test_forced_refresh_that_fails_cleaning_is_not_marked_retained(env, monkeypatch):
+    tmp_path, hindsight, _ = env
+    run(tmp_path, "--episode-id", "1")
+    assert states(tmp_path)["Played early"]["status"] == "retained"
+
+    def down(prompt, model):
+        raise RuntimeError("endpoint down")
+    monkeypatch.setattr(backfill, "cleaner_backend", lambda config: ("stub", down))
+    run(tmp_path, "--episode-id", "1", "--force")
+    record = states(tmp_path)["Played early"]
+    assert record["status"] == "transcribed" and "ad cleaning failed" in record["error"]
+
+
+def test_an_episode_that_kills_the_run_counts_as_an_attempt(env, monkeypatch):
+    tmp_path, _, _ = env
+
+    def crash(ep, recognizer, keep_audio):
+        raise SystemExit("killed")  # stands in for a crash no except clause sees
+    monkeypatch.setattr(backfill, "from_audio", crash)
+    for _ in range(3):
+        with pytest.raises(SystemExit):
+            run(tmp_path, "--episode-id", "2")
+    record = states(tmp_path)["Played late"]
+    assert record["status"] == "failed" and record["attempts"] == 3
+    assert run(tmp_path, "--episode-id", "2") == 0  # given up on: no fourth crash
+
+
+def test_stopping_mid_transcription_is_not_a_failed_attempt(env, monkeypatch):
+    tmp_path, _, _ = env
+
+    def stopped(ep, recognizer, keep_audio):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(backfill, "from_audio", stopped)
+    assert run(tmp_path, "--episode-id", "2") == 130
+    assert "status" not in states(tmp_path)["Played late"]
+
+
+def test_stop_while_waiting_for_the_cleaning_backlog_still_winds_down(env, monkeypatch):
+    tmp_path, _, _ = env
+    close = backfill.Finisher.close
+
+    def interrupted_close(self):
+        monkeypatch.setattr(backfill.Finisher, "close", close)
+        raise KeyboardInterrupt
+    monkeypatch.setattr(backfill.Finisher, "close", interrupted_close)
+    assert run(tmp_path, "--episode-id", "1") == 130
+
+
+def test_flush_carries_on_past_a_broken_record(env, monkeypatch):
+    tmp_path, _, _ = env
+
+    def down(prompt, model):
+        raise RuntimeError("endpoint down")
+    monkeypatch.setattr(backfill, "cleaner_backend", lambda config: ("stub", down))
+    run(tmp_path)
+    broken = states(tmp_path)["Played early"]
+    backfill.pathlib.Path(broken["transcript_json"]).write_text("{trunc")
+
+    monkeypatch.setattr(backfill, "cleaner_backend", lambda config: ("stub", ads_at_index(3)))
+    assert backfill.main(backfill.parse_args(["--flush", "--env-file", "/nonexistent"])) == 0
+    assert states(tmp_path)["Played late"]["status"] == "retained"
+
+
+def test_only_one_backfill_works_on_a_runtime_tree(env, monkeypatch):
+    tmp_path, hindsight, _ = env
+    monkeypatch.setattr(backfill, "LOCK_PATH", tmp_path / "backfill.lock")
+    with backfill.runtime_lock() as alone:
+        assert alone
+        assert run(tmp_path) == 2
+        assert backfill.main(backfill.parse_args(["--flush", "--env-file", "/x"])) == 2
+        assert backfill.main(backfill.parse_args(["--status", "--env-file", "/x"])) == 0
+    assert states(tmp_path) == {} and hindsight.requests == []
+    assert run(tmp_path) == 0
+
+
+def test_titles_in_any_script_keep_their_identity():
+    assert backfill.identity("पुलियाबाज़ी", "पहला एपिसोड") != \
+        backfill.identity("पुलियाबाज़ी", "दूसरा एपिसोड")
+    assert backfill.identity("Show", "Ep. One!") == backfill.identity("show", "ep one")
+    assert backfill.identity("Show", "  ") is None

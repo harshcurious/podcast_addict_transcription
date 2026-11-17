@@ -10,7 +10,8 @@
 #
 # launchd restarts the backfill if it crashes (after 5 minutes) and starts it again at login,
 # until `stop`. A run that finishes normally stays finished. The Mac is kept from idle sleep
-# while it runs. Re-run `install` to change the backup file or the options.
+# while it runs. Re-run `install` to change the backup file or the options. The service reads
+# its settings from backfill/config.env only, never from this shell's environment.
 set -euo pipefail
 
 LABEL=com.podcast-addict.backfill
@@ -21,14 +22,20 @@ PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 DOMAIN="gui/$(id -u)"
 TARGET="$DOMAIN/$LABEL"
 
+# PA_ROOT as backfill.py sees it under launchd: from config.env (quotes stripped, ~ expanded).
 pa_root() {
     local root=""
     if [ -f "$HERE/config.env" ]; then
-        root="$(sed -n 's/^PA_ROOT=//p' "$HERE/config.env" | tail -1)"
+        root="$(sed -n 's/^[[:space:]]*PA_ROOT[[:space:]]*=[[:space:]]*//p' "$HERE/config.env" \
+                | tail -1 | sed -e 's/[[:space:]]*$//' -e "s/^[\"']*//" -e "s/[\"']*\$//")"
     fi
-    echo "${PA_ROOT:-${root:-$HOME/podcast-backfill}}"
+    root="${root:-$HOME/podcast-backfill}"
+    case "$root" in "~" | "~/"*) root="$HOME${root:1}" ;; esac
+    echo "$root"
 }
 LOGS="$(pa_root)/logs"
+# Run backfill.py with the environment the LaunchAgent gives it.
+service_env() { env -i HOME="$HOME" PATH="$PATH" PYTHONUNBUFFERED=1 "$@"; }
 
 xml() { printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
 loaded() { launchctl print "$TARGET" >/dev/null 2>&1; }
@@ -109,7 +116,10 @@ start() {
         exit 2
     fi
     launchctl enable "$TARGET"
-    if ! loaded; then
+    if loaded; then
+        # Still loaded after a run that finished: start it again (no-op while it runs).
+        launchctl kickstart "$TARGET" 2>/dev/null || true
+    else
         launchctl bootstrap "$DOMAIN" "$PLIST"
     fi
     echo "started; follow it with: $0 logs"
@@ -119,8 +129,16 @@ stop() {
     launchctl disable "$TARGET" 2>/dev/null || true
     if loaded; then
         echo "stopping (the Episode being cleaned is finished first; up to 10 minutes)..."
-        launchctl bootout "$TARGET" 2>/dev/null || true
-        while loaded; do sleep 1; done
+        launchctl bootout "$TARGET" || true
+        local waited=0
+        while loaded; do
+            if [ "$waited" -ge 660 ]; then
+                echo "still loaded after 11 minutes; see: launchctl print $TARGET" >&2
+                exit 1
+            fi
+            sleep 1
+            waited=$((waited + 1))
+        done
         echo "stopped"
     fi
 }
@@ -133,7 +151,7 @@ status() {
     else
         echo "service: not installed"
     fi
-    "$PY" "$HERE/backfill.py" --status
+    service_env "$PY" "$HERE/backfill.py" --status
 }
 
 case "${1:-}" in
@@ -143,7 +161,7 @@ case "${1:-}" in
     stop) stop ;;
     restart) stop; start ;;
     status) status ;;
-    logs) touch "$LOGS/backfill.log"; tail -n 40 -f "$LOGS/backfill.log" ;;
+    logs) mkdir -p "$LOGS"; touch "$LOGS/backfill.log"; tail -n 40 -f "$LOGS/backfill.log" ;;
     uninstall) stop; rm -f "$PLIST"; echo "removed $PLIST" ;;
     *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

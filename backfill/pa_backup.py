@@ -96,7 +96,8 @@ def _has_table(conn, name):
 
 def listened_episodes(db_path):
     """Every listened Episode, most recently played first."""
-    conn = sqlite3.connect(f"file:{pathlib.Path(db_path)}?mode=ro", uri=True)
+    # as_uri() percent-encodes the path, so a '#' or '?' in it is not read as URI syntax.
+    conn = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     conn.text_factory = lambda raw: raw.decode("utf-8", "replace")  # feeds hold bad UTF-8
     try:

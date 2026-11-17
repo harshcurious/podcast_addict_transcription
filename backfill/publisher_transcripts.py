@@ -14,6 +14,7 @@ import json
 import pathlib
 import re
 import time
+import unicodedata
 import urllib.request
 import xml.etree.ElementTree as ET
 
@@ -165,7 +166,8 @@ class _Blocks(html.parser.HTMLParser):
 
 def parse_blocks(blocks):
     """Text blocks -> cues. A block that is only a timestamp or only `Name:` applies to the
-    next block. If any block carries a timestamp, untimed blocks are page chrome and dropped."""
+    next block. If any block carries a timestamp, untimed blocks between timed ones continue
+    the cue before them, and untimed blocks around the transcript are page chrome."""
     cues, pending_time, pending_speaker = [], None, ""
     for block in blocks:
         if _CUE_TIME.fullmatch(block.strip("[]() ")):
@@ -182,12 +184,23 @@ def parse_blocks(blocks):
             cues.append({"start": start, "end": None, "text": block.strip(),
                          "speaker": pending_speaker})
         pending_time, pending_speaker = None, ""
-    if any(c["start"] is not None for c in cues):
-        cues = [c for c in cues if c["start"] is not None]
-        # Page chrome before the transcript (a duration badge, a player) can carry a
-        # timestamp too; the transcript itself begins at its earliest time.
-        first = min(range(len(cues)), key=lambda i: cues[i]["start"])
-        cues = cues[first:]
+    timed = [i for i, c in enumerate(cues) if c["start"] is not None]
+    if timed:
+        kept = []
+        for c in cues[timed[0]:timed[-1] + 1]:
+            if c["start"] is not None:
+                kept.append(c)
+            else:  # a paragraph continuing the timed cue before it
+                new_speaker = c["speaker"] and c["speaker"] != kept[-1]["speaker"]
+                kept[-1]["text"] += " " + (f"{c['speaker']}: {c['text']}" if new_speaker
+                                           else c["text"])
+        cues = kept
+        # Page chrome around the transcript (a duration badge, a player) can carry a
+        # timestamp too; it is out of order with the transcript next to it.
+        while len(cues) > 1 and cues[0]["start"] > cues[1]["start"]:
+            cues.pop(0)
+        while len(cues) > 1 and cues[-1]["start"] < cues[-2]["start"]:
+            cues.pop()
     return cues
 
 
@@ -229,6 +242,9 @@ def to_segments(cues, duration=0.0, *, max_chars=400, min_chars=120):
             nxt = cues[i + 1]["start"] if i + 1 < len(cues) else None
             c["end"] = nxt if nxt is not None and nxt >= c["start"] else \
                 c["start"] + len(c["text"].split()) / WORDS_PER_SECOND
+    # Cleaning removes whole Segments, so no Segment may be much longer than max_chars:
+    # a one-paragraph transcript would otherwise go entirely with its sponsor read.
+    cues = [piece for c in cues for piece in _split_long(c, max_chars)]
 
     segments, current, last_speaker = [], None, ""
     for c in cues:
@@ -251,6 +267,29 @@ def to_segments(cues, duration=0.0, *, max_chars=400, min_chars=120):
     for seg in segments:
         seg["start"], seg["end"] = round(seg["start"], 2), round(seg["end"], 2)
     return segments, ("estimated" if estimated else "exact")
+
+
+def _split_long(cue, max_chars):
+    """Split a cue longer than max_chars at sentence ends (or words), sharing its time."""
+    if len(cue["text"]) <= max_chars:
+        return [cue]
+    pieces, current = [], ""
+    for sentence in re.split(r"(?<=[.!?।])\s+", cue["text"]):
+        for unit in (sentence.split() if len(sentence) > max_chars else [sentence]):
+            if current and len(current) + 1 + len(unit) > max_chars:
+                pieces.append(current)
+                current = unit
+            else:
+                current = f"{current} {unit}" if current else unit
+    if current:
+        pieces.append(current)
+    total = sum(len(p.split()) for p in pieces)
+    clock, span, out = cue["start"], cue["end"] - cue["start"], []
+    for piece in pieces:
+        end = clock + span * len(piece.split()) / total
+        out.append({**cue, "start": clock, "end": end, "text": piece})
+        clock = end
+    return out
 
 
 def is_plausible(segments, duration):
@@ -316,7 +355,9 @@ class FeedIndex:
 
 
 def _norm(text):
-    return re.sub(r"[^a-z0-9]+", "", text.lower())
+    """A title for matching: letters, digits and combining marks of any script, case-folded."""
+    return "".join(ch for ch in unicodedata.normalize("NFKC", text).casefold()
+                   if unicodedata.category(ch)[0] in "LNM")
 
 
 # ------------------------------------------------------------------------------- find

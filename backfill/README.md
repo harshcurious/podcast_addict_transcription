@@ -101,8 +101,15 @@ The LaunchAgent (`~/Library/LaunchAgents/com.podcast-addict.backfill.plist`) poi
 this checkout and its `backfill/.venv` by absolute path, and records your shell's `PATH`
 when you install (launchd's own lacks Homebrew, so `ffmpeg` and `opencode` would not be
 found). Re-run `install` after moving the checkout, changing `PATH`, or to change the
-backup file or options. Output that is not in `backfill.log` (tracebacks) goes to
-`logs/service.log`.
+backup file or options. The service takes every other setting from `backfill/config.env`
+only; variables exported in your shell do not reach it. Output that is not in
+`backfill.log` (tracebacks) goes to `logs/service.log`.
+
+Only one backfill works on a runtime tree at a time: while the service runs, a manual run
+or `--flush` exits with an error (`--status` and `--dry-run` still work). If Hindsight's
+document list cannot be read at the start (Tailscale not up yet, say), the run stops
+rather than transcribe Episodes the Pi already has, and the service tries again 5 minutes
+later.
 
 Re-running is always safe. Each Episode's progress is kept in
 `$PA_ROOT/backfill-state/<key>.json`, where the key comes from the feed URL and the item
@@ -115,7 +122,7 @@ Episode statuses:
 | `retained` | Hindsight accepted the Clean transcript |
 | `pi-pipeline` | the Pi already retained this Episode; skipped |
 | `waiting` | `--online-only` found no transcript; a full run will transcribe it |
-| `failed` | no transcript could be made (dead audio URL…); retried up to `--max-attempts` |
+| `failed` | no transcript could be made (dead audio URL…, or the run crashed on it); retried up to `--max-attempts` |
 
 Ad cleaning stops for the rest of a run after `PA_BACKFILL_MAX_CLEAN_FAILURES` failures in
 a row (for example, the model endpoint is down), but transcription carries on;

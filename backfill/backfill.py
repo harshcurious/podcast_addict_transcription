@@ -24,7 +24,9 @@ Runtime tree under PA_ROOT (default ~/podcast-backfill):
     backfill-state/<episode-key>.json   hindsight-pending/   hindsight-receipts/
 """
 import argparse
+import contextlib
 import datetime as dt
+import fcntl
 import json
 import os
 import pathlib
@@ -70,7 +72,8 @@ def parse_args(argv=None):
                     help="retry Episodes that already failed --max-attempts times")
     ap.add_argument("--max-attempts", type=int, default=3)
     ap.add_argument("--force", action="store_true",
-                    help="redo Episodes already retained (same Hindsight document is replaced)")
+                    help="redo Episodes already retained (same Hindsight document is replaced;"
+                         " Episodes the Pi retained are still skipped)")
     ap.add_argument("--keep-audio", action="store_true", help="keep downloaded audio in work/")
     return ap.parse_args(argv)
 
@@ -102,6 +105,7 @@ OUT = pathlib.Path(os.environ["PA_OUTDIR"]).expanduser()
 WORK = ROOT / "work"
 STATE_DIR = ROOT / "backfill-state"
 LOG_PATH = ROOT / "logs" / "backfill.log"
+LOCK_PATH = ROOT / "backfill.lock"
 MAX_AUDIO_BYTES = int(os.environ.get("PA_MAX_MB", "800")) * 1024 * 1024
 MAX_CLEAN_FAILURES = int(os.environ.get("PA_BACKFILL_MAX_CLEAN_FAILURES", "5"))
 HINDSIGHT_BACKOFF = 600
@@ -268,6 +272,8 @@ def obtain(ep, record, feeds, recognizer, opts):
     Transcript(path, meta, segments).save_raw()
     with (OUT / "index.jsonl").open("a") as f:
         f.write(json.dumps({"md": str(path.with_suffix(".md")), **meta}) + "\n")
+    for stale in ("hindsight_pending", "retained_at"):  # they belong to the old transcript
+        record.pop(stale, None)
     record.update(status="transcribed", transcript_json=str(path), error="",
                   source=meta["transcript_source"], transcript_model=meta["model"],
                   transcribed_at=meta["transcribed_at"])
@@ -409,27 +415,32 @@ class Finisher:
 
 # ------------------------------------------------------------------------- selection
 
+def identity(show, title):
+    """(show, title) as compared with the Pi's documents; None when the title is empty."""
+    title = online._norm(title)
+    return (online._norm(show), title) if title else None
+
+
 def already_in_hindsight():
-    """(show, title) pairs the Pi pipeline already retained, to avoid a second copy."""
+    """(show, title) pairs the Pi pipeline already retained, to avoid a second copy.
+
+    Raises if the list cannot be read: carrying on would transcribe the Pi's Episodes again.
+    """
     seen, offset = set(), 0
-    try:
-        while True:
-            url = (f"{hindsight_save.API_URL}/v1/default/banks/{hindsight_save.BANK_ID}"
-                   f"/documents?limit=100&offset={offset}")
-            body, _ = online.http_get(url, timeout=hindsight_save.TIMEOUT)
-            page = json.loads(body)
-            for doc in page.get("items", []):
-                meta = (doc.get("retain_params") or {}).get("metadata") or {}
-                if doc.get("id", "").startswith("podcast:") and \
-                        not doc["id"].startswith("podcast:episode:"):
-                    seen.add((online._norm(meta.get("show", "")),
-                              online._norm(meta.get("title", ""))))
-            offset += len(page.get("items", []))
-            if not page.get("items") or offset >= page.get("total", 0):
-                return seen
-    except Exception as exc:
-        log(f"WARNING could not list Hindsight documents ({exc}); no Pi duplicates skipped")
-        return seen
+    while True:
+        url = (f"{hindsight_save.API_URL}/v1/default/banks/{hindsight_save.BANK_ID}"
+               f"/documents?limit=100&offset={offset}")
+        body, _ = online.http_get(url, timeout=hindsight_save.TIMEOUT)
+        page = json.loads(body)
+        for doc in page.get("items", []):
+            meta = (doc.get("retain_params") or {}).get("metadata") or {}
+            if doc.get("id", "").startswith("podcast:") and \
+                    not doc["id"].startswith("podcast:episode:"):
+                seen.add(identity(meta.get("show", ""), meta.get("title", "")))
+        offset += len(page.get("items", []))
+        if not page.get("items") or offset >= page.get("total", 0):
+            seen.discard(None)
+            return seen
 
 
 def select(episodes, opts):
@@ -446,9 +457,11 @@ def select(episodes, opts):
 
 def needs_work(record, opts):
     status = record.get("status")
+    if status == "pi-pipeline":
+        return False  # even with --force: the Pi's own document already holds it
     if opts.force or status is None:
         return True
-    if status == "retained" or status == "pi-pipeline":
+    if status == "retained":
         return False
     if status == "failed":
         return opts.retry_failed or record.get("attempts", 0) < opts.max_attempts
@@ -474,13 +487,31 @@ def stop_gracefully_on_sigterm():
     signal.signal(signal.SIGTERM, handler)
 
 
+@contextlib.contextmanager
+def runtime_lock():
+    """Yield True while this process alone works on the runtime tree, False if another does."""
+    LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOCK_PATH.open("a") as f:
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+
+
 def run(opts):
     db = database_path(opts.backup, WORK)
     episodes = list(select(listened_episodes(db), opts))
     log(f"{len(episodes)} listened Episode(s) selected from {pathlib.Path(opts.backup).name}")
     state = State(STATE_DIR)
     feeds = None if opts.no_online else online.FeedIndex(WORK / "feeds", log=log)
-    pi_done = set() if opts.force or opts.dry_run else already_in_hindsight()
+    try:
+        pi_done = set() if opts.dry_run else already_in_hindsight()
+    except Exception as exc:
+        log(f"ERROR could not list Hindsight documents ({exc}); stopping so that no "
+            "Episode the Pi already retained is transcribed again")
+        return 1
     recognizer_box = []
 
     def recognizer():
@@ -495,7 +526,7 @@ def run(opts):
 
     keep_awake()
     finisher =None if opts.no_postprocess else Finisher(state).start()
-    counts, started = Counter(), 0
+    counts, started, interrupted = Counter(), 0, False
     try:
         for ep in episodes:
             record = state.get(ep.key)
@@ -503,7 +534,7 @@ def run(opts):
                 counts["skipped"] += 1
                 continue
             record["episode"] = episode_record(ep)
-            if (online._norm(ep.podcast), online._norm(ep.title)) in pi_done:
+            if identity(ep.podcast, ep.title) in pi_done:
                 record.update(status="pi-pipeline", error="")
                 state.put(record)
                 counts["already_from_pi"] += 1
@@ -515,12 +546,22 @@ def run(opts):
             have = record.get("transcript_json") and pathlib.Path(
                 record["transcript_json"]).exists()
             if opts.force or not have:
+                # Count the attempt first, so an Episode that crashes or kills the process
+                # (out of memory, an ASR crash) is given up after --max-attempts as well.
+                before = dict(record)
+                record.update(status="failed", attempts=record.get("attempts", 0) + 1,
+                              error="the run ended while this Episode was being transcribed")
+                state.put(record)
                 try:
                     obtain(ep, record, feeds, recognizer, opts)
+                except KeyboardInterrupt:
+                    state.put(before)  # stopped on purpose: not a failed attempt
+                    raise
                 except Exception as exc:
-                    record.update(status="failed", error=str(exc)[:500],
-                                  attempts=record.get("attempts", 0) + 1)
+                    record.update(status="failed", error=str(exc)[:500])
                     log(f"ERROR no transcript: {exc}")
+                else:
+                    record.pop("attempts", None)
                 state.put(record)
                 if record["status"] != "transcribed":
                     counts[record["status"]] += 1
@@ -529,15 +570,23 @@ def run(opts):
             if finisher:
                 finisher.submit(record)
     except KeyboardInterrupt:
+        interrupted = True
         log("interrupted; finishing the Episode being cleaned, the rest resume next run")
         if finisher:
             finisher.stop.set()
     finally:
         if finisher:
-            finisher.close()
+            try:
+                finisher.close()
+            except KeyboardInterrupt:  # stopped while waiting for the cleaning backlog
+                interrupted = True
+                log("interrupted; finishing the Episode being cleaned, the rest resume next run")
+                finisher.stop.set()
+                finisher.thread.join()
+                reconcile(state)
             counts.update(finisher.counts)
     log("summary: " + ", ".join(f"{k}={v}" for k, v in sorted(counts.items())))
-    return 0
+    return 130 if interrupted else 0
 
 
 def dry_run(episodes, state, feeds, opts):
@@ -559,7 +608,6 @@ def dry_run(episodes, state, feeds, opts):
 
 
 def status():
-    reconcile(State(STATE_DIR))
     records = State(STATE_DIR).all()
     by_status = Counter(r.get("status") for r in records)
     by_source = Counter(r.get("source") for r in records if r.get("source"))
@@ -581,7 +629,10 @@ def flush():
     finisher = Finisher(state)
     for record in state.all():
         if record.get("status") == "transcribed" and record.get("transcript_json"):
-            finisher.finish(record)
+            try:
+                finisher.finish(record)
+            except Exception as exc:  # one broken record must not stop the rest
+                log(f"ERROR finishing {record.get('key')}: {exc!r}")
     hindsight_save.flush(finisher.post)
     reconcile(state)
     status()
@@ -590,18 +641,29 @@ def flush():
 
 def main(opts):
     if opts.status:
+        with runtime_lock() as alone:
+            if alone:
+                reconcile(State(STATE_DIR))
+            else:
+                print("(a backfill is running; its latest Hindsight receipts may not be "
+                      "counted yet)")
         return status()
-    if opts.flush:
-        return flush()
-    if not opts.backup:
+    if not opts.flush and not opts.backup:
         print("error: BACKUP is required (or use --status / --flush)", file=sys.stderr)
         return 2
-    try:
-        database_path(opts.backup, WORK)  # check the backup before any other work
-    except (OSError, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    return run(opts)
+    with (contextlib.nullcontext(True) if opts.dry_run else runtime_lock()) as alone:
+        if not alone:
+            print(f"error: another backfill is already running on {ROOT} "
+                  "(the service? see backfill/service.sh status)", file=sys.stderr)
+            return 2
+        if opts.flush:
+            return flush()
+        try:
+            database_path(opts.backup, WORK)  # check the backup before any other work
+        except (OSError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        return run(opts)
 
 
 if __name__ == "__main__":

@@ -97,3 +97,10 @@ def test_transcript_url_formats():
     assert parse_transcript_urls("") == ()
     assert parse_transcript_urls("https://x/t.srt") == (("", "https://x/t.srt"),)
     assert parse_transcript_urls("{broken") == ()
+
+
+def test_a_hash_or_question_mark_in_the_path_is_not_uri_syntax(tmp_path):
+    folder = tmp_path / "backup #1?"
+    folder.mkdir()
+    make_db(folder / "podcastAddict.db")
+    assert len(listened_episodes(folder / "podcastAddict.db")) == 3
