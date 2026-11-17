@@ -209,3 +209,10 @@ def test_unspaced_scripts_count_a_word_per_character():
     assert pt.count_words("Hello there, 世界です。 — ok") == 2 + 4 + 1
     segments = [{"start": 0, "end": 600, "text": "これは文です。" * 300}]
     assert pt.is_plausible(segments, 600)[0]
+
+
+def test_word_counting_stays_fast_on_hostile_text():
+    import time
+    started = time.perf_counter()
+    assert pt.count_words("-" * 200_000 + " word") == 1
+    assert time.perf_counter() - started < 2
